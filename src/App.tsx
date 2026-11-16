@@ -14,9 +14,12 @@ import { supabaseConfigured } from "./lib/supabase"
 import {
   type Dose,
   type RealResident,
+  addActivityDb,
   addHouseQuestion,
   addPrescription,
   askAssistantAi,
+  askReportAi,
+  loadPendingList,
   answerHouseQuestion,
   createVideoRequest,
   loadTakenSlots,
@@ -24,9 +27,15 @@ import {
   loadVideoRequests,
   realFutureDays,
   saveVideoConfig,
+  updateActivityDb,
   updateVideoRequest,
   groupDoses,
+  loadActivities,
   loadAlertMinutes,
+  loadConsentFlags,
+  loadPhotos,
+  publishPhotoDb,
+  removePhotoDb,
   loadHouseAnswers,
   loadHouseQuestions,
   loadPendingCount,
@@ -75,8 +84,9 @@ type ResidentMessage = {
   text: string
 }
 type ActivityStatus = "Programada" | "Realizada" | "Não realizada"
+type ActivityId = number | string
 type Activity = {
-  id: number
+  id: ActivityId
   name: string
   time: string
   status: ActivityStatus
@@ -94,8 +104,11 @@ type HouseInfo = {
 }
 type AssistantTopic = "custom" | "medicines" | "allMedicines" | "activities" | "visits" | "video" | "clinical" | "unknown"
 
+type PhotoId = number | string
 type Photo = {
-  id: number
+  rowIds?: string[]
+  paths?: string[]
+  id: PhotoId
   src: string
   caption: string
   residents: string[]
@@ -1331,7 +1344,9 @@ function Summary({
   videoRequests,
   onOpenVideo,
   doses,
+  residentName = "Maria Silva",
 }: {
+  residentName?: string
   doses?: Dose[] | null
   activities: Activity[]
   houseInfo: HouseInfo
@@ -1365,7 +1380,7 @@ function Summary({
   const completedActivities = activities.filter((activity) => activity.status === "Realizada")
   const isToday = selectedDay === 12
   const past = PAST_DAYS.find((day) => day.n === selectedDay)
-  const dayPhotos = photos.filter((photo) => photo.day === selectedDay && photo.residents.includes("Maria Silva"))
+  const dayPhotos = photos.filter((photo) => photo.day === selectedDay && photo.residents.includes(residentName))
   const weekdays = [...PAST_DAYS.map((day) => ({ n: day.n, wd: day.wd, mood: day.mood })), { n: 12, wd: "sex", mood: "Muito bem" }]
   const nextCall = videoRequests.find((request) => (supabaseConfigured || request.resident === "Maria Silva") && request.status === "Confirmada")
   const weekActivities = PAST_DAYS.reduce((sum, day) => sum + day.done, 0) + completedActivities.length
@@ -1631,6 +1646,42 @@ function ResidentConversation({
   )
 }
 
+/** Texto do relatório montado só com o que a equipe registrou (sem inventar nada). */
+function buildShiftReport(name: string, activities: Activity[], doses: Dose[] | null): string {
+  const first = name.split(" ")[0]
+  const parts: string[] = []
+  const done = activities.filter((a) => a.status === "Realizada")
+  const refused = activities.filter((a) => a.status === "Não realizada")
+  const waiting = activities.filter((a) => a.status === "Programada")
+  const withNote = (a: Activity) => `${a.name}${a.observation?.trim() ? ` (${a.observation.trim().replace(/[.]+$/, "")})` : ""}`
+  done.forEach((a) => {
+    parts.push(
+      a.participation === "Participou pouco"
+        ? `${first} participou pouco de ${withNote(a)}.`
+        : `${first} participou de ${withNote(a)}.`,
+    )
+  })
+  refused.forEach((a) => parts.push(`${first} não quis participar de ${withNote(a)}.`))
+  if (waiting.length > 0) {
+    parts.push(`Ainda não houve registro de: ${waiting.map((a) => a.name).join(", ")}.`)
+  }
+  if (activities.length === 0) parts.push("Não há atividades registradas hoje.")
+  if (doses) {
+    const given = doses.filter((d) => d.status === "administrado").length
+    const pending = doses.filter((d) => d.status === "aguardando")
+    if (doses.length > 0) {
+      parts.push(
+        pending.length === 0
+          ? `Todas as ${doses.length} doses de medicamento do dia foram administradas.`
+          : `${given} de ${doses.length} doses de medicamento foram administradas; aguardam: ${pending.map((d) => `${d.medicine} às ${d.time}`).join(", ")}.`,
+      )
+    }
+  } else {
+    parts.push("Os medicamentos previstos foram acompanhados pela equipe.")
+  }
+  return parts.join(" ")
+}
+
 function TeamPanel({
   activitiesByResident,
   conversations,
@@ -1654,7 +1705,7 @@ function TeamPanel({
   unreadConversations: Record<string, boolean>
   onMarkAsRead: (residentName: string) => void
   onSendMessage: (residentName: string, message: string, sender: Role) => void
-  onUpdateActivity: (residentName: string, id: number, updates: Partial<Activity>) => void
+  onUpdateActivity: (residentName: string, id: ActivityId, updates: Partial<Activity>) => void
 }) {
   const [query, setQuery] = useState("")
   const [selected, setSelected] = useState<ResidentCard | null>(null)
@@ -1663,6 +1714,49 @@ function TeamPanel({
   const [rxTime, setRxTime] = useState("08:00")
   const [rxError, setRxError] = useState("")
   const [busyDose, setBusyDose] = useState("")
+  // Rascunhos: o que a equipe marca só vai para a família depois de confirmar (ou ao aprovar o relatório).
+  const [drafts, setDrafts] = useState<Record<string, Partial<Activity>>>({})
+  const generateReport = async () => {
+    if (!selected) return
+    const merged = (activitiesByResident[selected.name] ?? []).map((item) => ({
+      ...item,
+      ...drafts[`${selected.name}:${item.id}`],
+    }))
+    const residentDoses = supabaseConfigured && selected.id ? doses.filter((dose) => dose.residentId === selected.id) : null
+    const local = buildShiftReport(selected.name, merged, residentDoses)
+    if (!supabaseConfigured) {
+      setReportText(local)
+      return
+    }
+    setReportLoading(true)
+    setReportText("Gerando o relatório…")
+    // A IA só reescreve em linguagem natural os fatos já registrados; se falhar, vale o texto montado aqui.
+    const written = await askReportAi(`Residente: ${selected.name}\n${local}`)
+    setReportText(written ?? local)
+    setReportLoading(false)
+  }
+  const draftKey = (residentName: string, id: ActivityId) => `${residentName}:${id}`
+  const setDraft = (residentName: string, id: ActivityId, patch: Partial<Activity>) =>
+    setDrafts((current) => ({ ...current, [draftKey(residentName, id)]: { ...current[draftKey(residentName, id)], ...patch } }))
+  const confirmDraft = (residentName: string, id: ActivityId) => {
+    const key = draftKey(residentName, id)
+    const draft = drafts[key]
+    if (!draft) return
+    onUpdateActivity(residentName, id, { ...draft, registeredBy: "Elisa Pereira", registeredAt: currentTime })
+    setDrafts((current) => {
+      const { [key]: _removed, ...rest } = current
+      return rest
+    })
+  }
+  const confirmAllDrafts = (residentName: string) => {
+    Object.keys(drafts)
+      .filter((key) => key.startsWith(`${residentName}:`))
+      .forEach((key) => {
+        const raw = key.slice(residentName.length + 1)
+        const activity = (activitiesByResident[residentName] ?? []).find((item) => String(item.id) === raw)
+        if (activity) confirmDraft(residentName, activity.id)
+      })
+  }
   const [profilePage, setProfilePage] = useState<"record" | "chat" | "report">("record")
   const [saved, setSaved] = useState(false)
   const [notesSaved, setNotesSaved] = useState(false)
@@ -1671,7 +1765,8 @@ function TeamPanel({
   const [notes, setNotes] = useState("Maria esteve tranquila e comunicativa. Alimentou-se bem no almoço e participou da oficina de pintura.")
   const [dictating, setDictating] = useState(false)
   const [reportStatus, setReportStatus] = useState<"idle" | "draft" | "editing" | "approved">("idle")
-  const [reportText, setReportText] = useState("Maria passou o plantão tranquila, alimentou-se bem e participou da oficina de pintura. Os medicamentos previstos foram acompanhados pela equipe.")
+  const [reportText, setReportText] = useState("")
+  const [reportLoading, setReportLoading] = useState(false)
   const [reportDiscardConfirm, setReportDiscardConfirm] = useState(false)
   const closeReportDiscard = useBackDismiss(
     reportDiscardConfirm,
@@ -1809,8 +1904,8 @@ function TeamPanel({
                     O resumo diário da família será atualizado somente depois da aprovação.
                   </p>
                   <div className="report-actions">
-                    <button onClick={() => setReportStatus("editing")} type="button">Editar</button>
-                    <button onClick={() => setReportStatus("approved")} type="button">
+                    <button disabled={reportLoading} onClick={() => setReportStatus("editing")} type="button">Editar</button>
+                    <button disabled={reportLoading} onClick={() => { confirmAllDrafts(selected.name); setReportStatus("approved") }} type="button">
                       <Icon name="check" size={18} />
                       Aprovar e enviar à família
                     </button>
@@ -1996,7 +2091,10 @@ function TeamPanel({
               <div><span>Visível para a família</span><h2>Atividades do dia</h2></div>
             </div>
             <div className="activity-list">
-              {(activitiesByResident[selected.name] ?? []).map((activity) => (
+              {(activitiesByResident[selected.name] ?? []).map((saved) => {
+                const draft = drafts[draftKey(selected.name, saved.id)]
+                const activity: Activity = { ...saved, ...draft }
+                return (
                 <article className="activity-item" key={activity.id}>
                   <div className="activity-item__heading">
                     <div>
@@ -2022,11 +2120,9 @@ function TeamPanel({
                         aria-pressed={activity.participation === option}
                         key={option}
                         onClick={() =>
-                          onUpdateActivity(selected.name, activity.id, {
+                          setDraft(selected.name, activity.id, {
                             participation: option as Activity["participation"],
                             status: option === "Não quis" ? "Não realizada" : "Realizada",
-                            registeredBy: "Elisa Pereira",
-                            registeredAt: currentTime,
                           })
                         }
                         type="button"
@@ -2037,21 +2133,26 @@ function TeamPanel({
                   </div>
                   <input
                     aria-label={`Observação sobre ${activity.name}`}
-                    onChange={(event) =>
-                      onUpdateActivity(selected.name, activity.id, {
-                        observation: event.target.value,
-                        registeredBy: "Elisa Pereira",
-                        registeredAt: currentTime,
-                      })
-                    }
+                    onChange={(event) => setDraft(selected.name, activity.id, { observation: event.target.value })}
                     placeholder="Observação opcional"
                     value={activity.observation ?? ""}
                   />
-                  <small>
-                    {activity.status === "Programada" ? "Ainda não registrada" : `${activity.registeredBy} · ${activity.registeredAt}`}
-                  </small>
+                  {draft ? (
+                    <>
+                      <small>Ainda não enviado à família</small>
+                      <button className="outline-button" onClick={() => confirmDraft(selected.name, activity.id)} type="button">
+                        <Icon name="check" />
+                        Confirmar e enviar à família
+                      </button>
+                    </>
+                  ) : (
+                    <small>
+                      {saved.status === "Programada" ? "Ainda não registrada" : `${saved.registeredBy} · ${saved.registeredAt}`}
+                    </small>
+                  )}
                 </article>
-              ))}
+                )
+              })}
             </div>
             <div className="add-activity-form">
               <label>
@@ -2169,7 +2270,10 @@ function TeamPanel({
           <button
             className={reportStatus === "approved" ? "ai-button ai-button--success" : "ai-button"}
             onClick={() => {
-              if (reportStatus === "idle") setReportStatus("draft")
+              if (reportStatus === "idle") {
+                setReportStatus("draft")
+                void generateReport()
+              }
               window.history.pushState({ ...(window.history.state ?? {}), overlay: "resident-report" }, "", window.location.href)
               setProfilePage("report")
             }}
@@ -2323,8 +2427,10 @@ function AdminDashboard({
   unansweredQuestions,
   unreadConversations,
   pendingMedicines,
+  pendingList,
   overdueThreads,
 }: {
+  pendingList?: { id: string; medicine: string; dose: string; time: string; minutesLate: number }[]
   overdueThreads?: { resident: string; minutes: number }[]
   pendingMedicines?: number
   alertMinutes: 10 | 15 | 30
@@ -2567,6 +2673,29 @@ function AdminDashboard({
             {overdue.length === 0 && supabaseConfigured && (
               <p className="video-empty">Nenhum alerta no momento.</p>
             )}
+            {supabaseConfigured && (pendingList ?? []).map((item) => (
+              <article key={item.id}>
+                <span className="admin-alert-icon admin-alert-icon--pending"><Icon name="clock" /></span>
+                <div>
+                  <strong>{item.medicine} {item.dose} aguardando administração</strong>
+                  <small>Prevista para {item.time} · {item.minutesLate > 0 ? ago(item.minutesLate) : "ainda dentro do horário"}</small>
+                </div>
+                <button
+                  onClick={() =>
+                    setSelectedAlert({
+                      resident: "",
+                      involved: "Equipe de plantão",
+                      time: item.time,
+                      elapsed: item.minutesLate > 0 ? ago(item.minutesLate) : "dentro do horário",
+                      status: `${item.medicine} ${item.dose} · aguardando administração`,
+                    })
+                  }
+                  type="button"
+                >
+                  Ver
+                </button>
+              </article>
+            ))}
             {!supabaseConfigured && (
             <article>
               <span className="admin-alert-icon admin-alert-icon--pending"><Icon name="clock" /></span>
@@ -4430,24 +4559,37 @@ function TeamPhotos({
   photos,
   consent,
   activities,
+  activitiesByResident,
   onPublish,
   onRemove,
 }: {
   photos: Photo[]
   consent: Record<string, boolean>
   activities: Activity[]
-  onPublish: (photo: Omit<Photo, "id" | "author" | "time" | "day">) => void
-  onRemove: (id: number) => void
+  activitiesByResident?: Record<string, Activity[]>
+  onPublish: (photo: Omit<Photo, "id" | "author" | "time" | "day">) => void | Promise<boolean>
+  onRemove: (id: PhotoId) => void
 }) {
+  const [publishError, setPublishError] = useState("")
+  const [publishing, setPublishing] = useState(false)
   const names = Object.keys(consent)
   const [src, setSrc] = useState("")
   const [caption, setCaption] = useState("")
   const [activity, setActivity] = useState("")
-  const [tagged, setTagged] = useState<string[]>(["Maria Silva"])
+  const [tagged, setTagged] = useState<string[]>(supabaseConfigured ? [] : ["Maria Silva"])
   const [done, setDone] = useState("")
   const inputRef = useRef<HTMLInputElement>(null)
   const today = photos.filter((photo) => photo.day === 12)
   const validTags = tagged.filter((name) => consent[name])
+  // Atividades de hoje dos residentes marcados (ou de todos, enquanto ninguém foi marcado).
+  const activityOptions = Array.from(
+    new Set(
+      (activitiesByResident
+        ? (validTags.length > 0 ? validTags : Object.keys(activitiesByResident)).flatMap((name) => activitiesByResident[name] ?? [])
+        : activities
+      ).map((item) => item.name),
+    ),
+  )
 
   const onFile = (file?: File) => {
     if (!file) return
@@ -4468,9 +4610,16 @@ function TeamPhotos({
     reader.readAsDataURL(file)
   }
 
-  const publish = () => {
-    if (!src || validTags.length === 0) return
-    onPublish({ src, caption: caption.trim() || activity || "Foto do dia", residents: validTags })
+  const publish = async () => {
+    if (!src || validTags.length === 0 || publishing) return
+    setPublishing(true)
+    setPublishError("")
+    const ok = await onPublish({ src, caption: caption.trim() || activity || "Foto do dia", residents: validTags })
+    setPublishing(false)
+    if (ok === false) {
+      setPublishError("Não foi possível publicar a foto. Confira a autorização de imagem e tente de novo.")
+      return
+    }
     setDone(`Foto publicada para as famílias de: ${validTags.join(", ")}.`)
     setSrc("")
     setCaption("")
@@ -4510,7 +4659,7 @@ function TeamPhotos({
             Atividade (opcional)
             <select onChange={(event) => setActivity(event.target.value)} value={activity}>
               <option value="">Sem atividade</option>
-              {activities.map((item) => <option key={item.id}>{item.name}</option>)}
+              {activityOptions.map((name) => <option key={name}>{name}</option>)}
             </select>
           </label>
           <label>
@@ -4540,7 +4689,8 @@ function TeamPhotos({
             Só é possível marcar residentes com autorização de uso de imagem válida, cadastrada pela
             administração. Cada família vê apenas as fotos em que o seu residente aparece.
           </p>
-          <button className="primary-button" disabled={!src || validTags.length === 0} onClick={publish} type="button">
+          {publishError && <p className="login-error" role="alert">{publishError}</p>}
+          <button className="primary-button" disabled={!src || validTags.length === 0 || publishing} onClick={publish} type="button">
             <Icon name="check" />
             Publicar para as famílias
           </button>
@@ -4623,6 +4773,7 @@ export default function App() {
   const [realResidents, setRealResidents] = useState<RealResident[]>([])
   const [realDoses, setRealDoses] = useState<Dose[]>([])
   const [pendingMedicines, setPendingMedicines] = useState(0)
+  const [pendingList, setPendingList] = useState<{ id: string; medicine: string; dose: string; time: string; minutesLate: number }[]>([])
   const [overdueThreads, setOverdueThreads] = useState<{ resident: string; minutes: number }[]>([])
   const reloadMessages = async (list: RealResident[] = realResidents) => {
     if (!supabaseConfigured || !account) return
@@ -4656,16 +4807,31 @@ export default function App() {
     setCustomAnswers(answers)
     if (minutes) setAlertMinutes(minutes)
     if (role === "admin") {
-      const [pending, questions, residentsList] = await Promise.all([loadPendingCount(), loadHouseQuestions(), loadResidents()])
+      const [pending, questions, residentsList, pendingItems] = await Promise.all([
+        loadPendingCount(),
+        loadHouseQuestions(),
+        loadResidents(),
+        loadPendingList(),
+      ])
       setPendingMedicines(pending)
+      setPendingList(pendingItems)
       setUnansweredQuestions(questions)
       setRealResidents(residentsList)
       await reloadMessages(residentsList)
       return
     }
-    const [list, doseList] = await Promise.all([loadResidents(), loadTodayDoses()])
+    const [list, doseList, acts, photoList, consent] = await Promise.all([
+      loadResidents(),
+      loadTodayDoses(),
+      loadActivities(),
+      loadPhotos(),
+      loadConsentFlags(),
+    ])
     setRealResidents(list)
     setRealDoses(doseList)
+    setActivitiesByResident(acts)
+    setPhotos(photoList)
+    setRealConsent(consent)
     await reloadMessages(list)
   }
   useEffect(() => {
@@ -4680,7 +4846,7 @@ export default function App() {
     updatedBy: "Marta Andrade",
     updatedAt: "12 de junho às 09:15",
   })
-  const [activitiesByResident, setActivitiesByResident] = useState<Record<string, Activity[]>>({
+  const [activitiesByResident, setActivitiesByResident] = useState<Record<string, Activity[]>>(supabaseConfigured ? {} : {
     "Maria Silva": [
       {
         id: 1,
@@ -4728,7 +4894,8 @@ export default function App() {
     "Roberto Santos": false,
   })
 
-  const [photos, setPhotos] = useState<Photo[]>([
+  const [realConsent, setRealConsent] = useState<Record<string, boolean>>({})
+  const [photos, setPhotos] = useState<Photo[]>(supabaseConfigured ? [] : [
     { id: 1, src: SAMPLE_PAINTING, caption: "Oficina de pintura", residents: ["Maria Silva"], author: "Elisa Pereira", time: "11:00", day: 12 },
     { id: 2, src: SAMPLE_GARDEN, caption: "Passeio no jardim", residents: ["Maria Silva", "João Pereira"], author: "Elisa Pereira", time: "15:10", day: 10 },
   ])
@@ -4740,9 +4907,9 @@ export default function App() {
   })
   const [registrations, setRegistrations] = useState<Registrations>(INITIAL_REGISTRATIONS)
   const [changeLog, setChangeLog] = useState<ChangeLogEntry[]>(INITIAL_LOG)
-  const consentFlags = Object.fromEntries(
-    Object.entries(imageConsent).map(([name, info]) => [name, consentActive(info)]),
-  )
+  const consentFlags = supabaseConfigured
+    ? realConsent
+    : Object.fromEntries(Object.entries(imageConsent).map(([name, info]) => [name, consentActive(info)]))
   const [videoConfig, setVideoConfig] = useState<VideoConfig>({
     days: [1, 3, 5, 6],
     start: "15:00",
@@ -4776,8 +4943,27 @@ export default function App() {
     setVideoRequests((current) => current.map((request) => (request.id === id ? { ...request, ...patch } : request)))
     if (supabaseConfigured) void updateVideoRequest(String(id), patch).then(() => reloadVideo())
   }
-  const publishPhoto = (photo: Omit<Photo, "id" | "author" | "time" | "day">) =>
+  const publishPhoto = (photo: Omit<Photo, "id" | "author" | "time" | "day">): void | Promise<boolean> => {
+    if (supabaseConfigured) {
+      const ids = photo.residents
+        .map((name) => realResidents.find((resident) => resident.name === name)?.id)
+        .filter((id): id is string => !!id)
+      if (ids.length === 0) return Promise.resolve(false)
+      return publishPhotoDb(photo.src, photo.caption, ids).then(async (ok) => {
+        if (ok) await reloadMedication()
+        return ok
+      })
+    }
     setPhotos((current) => [{ ...photo, id: Date.now(), author: "Elisa Pereira", time: nowTime(), day: 12 }, ...current])
+  }
+  const removePhoto = (id: PhotoId) => {
+    if (supabaseConfigured) {
+      const photo = photos.find((item) => item.id === id)
+      if (photo?.rowIds && photo.paths) void removePhotoDb(photo.rowIds, photo.paths).then(() => reloadMedication())
+      return
+    }
+    setPhotos((current) => current.filter((photo) => photo.id !== id))
+  }
   const slotRequests: VideoRequest[] = [
     ...videoRequests,
     ...takenSlots.map((slot, index) => ({ id: `taken-${index}`, resident: "", requester: "", ...slot, status: "Solicitada" as VideoStatus })),
@@ -4927,6 +5113,11 @@ export default function App() {
   }, [account])
 
   const addActivity = (residentName: string, name: string, time: string) => {
+    if (supabaseConfigured) {
+      const resident = realResidents.find((item) => item.name === residentName)
+      if (resident) void addActivityDb(resident.id, name, time).then(() => reloadMedication())
+      return
+    }
     setActivitiesByResident((current) => ({
       ...current,
       [residentName]: [
@@ -4946,11 +5137,29 @@ export default function App() {
     }))
   }
 
+  const activityTimers = useRef<Record<string, { timer: number; patch: Record<string, string> }>>({})
   const updateActivity = (
     residentName: string,
-    id: number,
+    id: ActivityId,
     updates: Partial<Activity>,
   ) => {
+    if (supabaseConfigured) {
+      // Quem registrou aparece já na tela; o banco grava o nome e o horário de verdade.
+      updates = { ...updates, registeredBy: account?.name ?? updates.registeredBy }
+      const key = String(id)
+      const slot = activityTimers.current[key] ?? { timer: 0, patch: {} }
+      window.clearTimeout(slot.timer)
+      for (const field of ["status", "participation", "observation"] as const) {
+        const value = updates[field]
+        if (typeof value === "string") slot.patch[field] = value
+      }
+      slot.timer = window.setTimeout(() => {
+        const patch = slot.patch
+        delete activityTimers.current[key]
+        void updateActivityDb(key, patch).then(() => reloadMedication())
+      }, 700)
+      activityTimers.current[key] = slot
+    }
     setActivitiesByResident((current) => ({
       ...current,
       [residentName]: (current[residentName] ?? []).map((activity) =>
@@ -5003,7 +5212,7 @@ export default function App() {
             {screen === "chat" && (
               <Chat
                 doses={supabaseConfigured ? realDoses : null}
-                activities={activitiesByResident["Maria Silva"]}
+                activities={activitiesByResident[familyResident] ?? []}
                 customAnswers={customAnswers}
                 houseInfo={houseInfo}
                 onOpenVideo={() => navigate("family-video")}
@@ -5026,8 +5235,9 @@ export default function App() {
             )}
             {screen === "summary" && (
               <Summary
+                residentName={familyResident || "Maria Silva"}
                 doses={supabaseConfigured ? realDoses : null}
-                activities={activitiesByResident["Maria Silva"]}
+                activities={activitiesByResident[familyResident] ?? []}
                 houseInfo={houseInfo}
                 onOpenVideo={() => navigate("family-video")}
                 photos={photos}
@@ -5057,10 +5267,11 @@ export default function App() {
             )}
             {screen === "team-photos" && (
               <TeamPhotos
-                activities={activitiesByResident["Maria Silva"]}
+                activitiesByResident={activitiesByResident}
+                activities={activitiesByResident[familyResident] ?? []}
                 consent={consentFlags}
                 onPublish={publishPhoto}
-                onRemove={(id) => setPhotos((current) => current.filter((photo) => photo.id !== id))}
+                onRemove={removePhoto}
                 photos={photos}
               />
             )}
@@ -5111,6 +5322,7 @@ export default function App() {
             {screen === "admin-dashboard" && (
               <AdminDashboard
                 pendingMedicines={supabaseConfigured ? pendingMedicines : undefined}
+                pendingList={supabaseConfigured ? pendingList : undefined}
                 alertMinutes={alertMinutes}
                 conversations={conversations}
                 overdueThreads={supabaseConfigured ? overdueThreads : undefined}

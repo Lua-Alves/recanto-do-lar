@@ -34,5 +34,7 @@ insert into public.prescriptions (resident_id, medicine, dose, times) values
 -- Doses de hoje (fuso de São Paulo): manhã já administradas, 20:00 aguardando.
 select public.ensure_doses_today();
 update public.medication_administrations
-   set status = 'administrado'
+   set status = 'administrado',
+       administered_at = scheduled_for + interval '4 minutes',
+       administered_by = (select id from public.profiles where role = 'cuidador' order by created_at limit 1)
  where (scheduled_for at time zone 'America/Sao_Paulo')::time < time '20:00';

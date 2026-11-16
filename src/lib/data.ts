@@ -382,3 +382,206 @@ export async function askAssistantAi(question: string, residentId: string): Prom
     .trim()
   return { text: clean, forward }
 }
+
+// ---------------------------------------------------------------------
+// Atividades do dia
+// ---------------------------------------------------------------------
+
+export type RealActivity = {
+  id: string
+  name: string
+  time: string
+  status: "Programada" | "Realizada" | "Não realizada"
+  participation?: "Participou" | "Participou pouco" | "Não quis"
+  observation?: string
+  registeredBy: string
+  registeredAt: string
+}
+
+/** Atividades de hoje por nome de residente (a família só recebe as do seu residente). */
+export async function loadActivities(): Promise<Record<string, RealActivity[]>> {
+  if (!supabase) return {}
+  const today = spDate(new Date()).toISOString().slice(0, 10)
+  const [{ data }, { data: res }] = await Promise.all([
+    supabase
+      .from("activities")
+      .select("id, resident_id, activity_time, name, status, participation, observation, registered_by_name, registered_at")
+      .eq("activity_date", today)
+      .order("activity_time"),
+    supabase.from("residents").select("id, full_name"),
+  ])
+  const names = new Map((res ?? []).map((r: any) => [r.id, r.full_name as string]))
+  const out: Record<string, RealActivity[]> = {}
+  for (const row of (data ?? []) as any[]) {
+    const resident = names.get(row.resident_id)
+    if (!resident) continue
+    ;(out[resident] ??= []).push({
+      id: row.id,
+      name: row.name,
+      time: row.activity_time ? String(row.activity_time).slice(0, 5) : "",
+      status: row.status === "Realizada" || row.status === "Não realizada" ? row.status : "Programada",
+      participation: row.participation ?? undefined,
+      observation: row.observation ?? undefined,
+      registeredBy: row.registered_by_name ?? "",
+      registeredAt: row.registered_at ? hhmm(row.registered_at) : "",
+    })
+  }
+  return out
+}
+
+export async function addActivityDb(residentId: string, name: string, time: string): Promise<boolean> {
+  if (!supabase) return false
+  const { error } = await supabase
+    .from("activities")
+    .insert({ resident_id: residentId, name: name.trim(), activity_time: time, status: "Programada" })
+  return !error
+}
+
+export async function updateActivityDb(
+  id: string,
+  patch: { status?: string; participation?: string; observation?: string },
+): Promise<boolean> {
+  if (!supabase) return false
+  const { error } = await supabase.from("activities").update(patch).eq("id", id)
+  return !error
+}
+
+// ---------------------------------------------------------------------
+// Fotos (Storage privado "photos" + tabela photos)
+// ---------------------------------------------------------------------
+
+/** Quem tem autorização de uso de imagem vigente, por nome de residente. */
+export async function loadConsentFlags(): Promise<Record<string, boolean>> {
+  if (!supabase) return {}
+  const [{ data: res }, { data: cons }] = await Promise.all([
+    supabase.from("residents").select("id, full_name").eq("status", "ativo"),
+    supabase.from("image_consents").select("resident_id, authorized, valid_until"),
+  ])
+  const today = spDate(new Date()).toISOString().slice(0, 10)
+  const byId = new Map(
+    ((cons ?? []) as any[]).map((c) => [c.resident_id, !!c.authorized && (!c.valid_until || c.valid_until >= today)]),
+  )
+  return Object.fromEntries(((res ?? []) as any[]).map((r) => [r.full_name, byId.get(r.id) ?? false]))
+}
+
+export type RealPhoto = {
+  id: string
+  src: string
+  caption: string
+  residents: string[]
+  author: string
+  time: string
+  day: number
+  groupId: string
+  rowIds: string[]
+  paths: string[]
+}
+
+/** Dia da foto no calendário do app: hoje = 12; dias anteriores contam para trás. */
+const dayIndex = (iso: string) => {
+  const diff = Math.round((spDate(new Date()).setUTCHours(0, 0, 0, 0) - spDate(new Date(iso)).setUTCHours(0, 0, 0, 0)) / 86400000)
+  return 12 - Math.max(0, diff)
+}
+
+export async function loadPhotos(): Promise<RealPhoto[]> {
+  if (!supabase) return []
+  const [{ data }, { data: res }] = await Promise.all([
+    supabase
+      .from("photos")
+      .select("id, resident_id, storage_path, caption, created_at, group_id, author_name")
+      .order("created_at", { ascending: false }),
+    supabase.from("residents").select("id, full_name"),
+  ])
+  const rows = (data ?? []) as any[]
+  if (rows.length === 0) return []
+  const names = new Map((res ?? []).map((r: any) => [r.id, r.full_name as string]))
+  const { data: signed } = await supabase.storage.from("photos").createSignedUrls(rows.map((r) => r.storage_path), 3600)
+  const urlByPath = new Map(((signed ?? []) as any[]).map((s) => [s.path, s.signedUrl as string]))
+  const groups = new Map<string, RealPhoto>()
+  for (const row of rows) {
+    const key = row.group_id ?? row.id
+    const name = names.get(row.resident_id)
+    const existing = groups.get(key)
+    if (existing) {
+      if (name) existing.residents.push(name)
+      existing.rowIds.push(row.id)
+      existing.paths.push(row.storage_path)
+      continue
+    }
+    groups.set(key, {
+      id: key,
+      src: urlByPath.get(row.storage_path) ?? "",
+      caption: row.caption ?? "Foto do dia",
+      residents: name ? [name] : [],
+      author: row.author_name ?? "",
+      time: hhmm(row.created_at),
+      day: dayIndex(row.created_at),
+      groupId: key,
+      rowIds: [row.id],
+      paths: [row.storage_path],
+    })
+  }
+  return [...groups.values()].filter((photo) => photo.src)
+}
+
+const dataUrlToBlob = async (dataUrl: string) => (await fetch(dataUrl)).blob()
+
+/** Publica a foto para cada residente marcado (as regras do banco exigem autorização vigente). */
+export async function publishPhotoDb(
+  dataUrl: string,
+  caption: string,
+  residentIds: string[],
+): Promise<boolean> {
+  if (!supabase) return false
+  const blob = await dataUrlToBlob(dataUrl)
+  const groupId = crypto.randomUUID()
+  for (const residentId of residentIds) {
+    const path = `${residentId}/${crypto.randomUUID()}.jpg`
+    const { error: uploadError } = await supabase.storage.from("photos").upload(path, blob, { contentType: "image/jpeg" })
+    if (uploadError) return false
+    const { error } = await supabase
+      .from("photos")
+      .insert({ resident_id: residentId, storage_path: path, caption, group_id: groupId })
+    if (error) {
+      await supabase.storage.from("photos").remove([path])
+      return false
+    }
+  }
+  return true
+}
+
+export async function removePhotoDb(rowIds: string[], paths: string[]): Promise<boolean> {
+  if (!supabase) return false
+  const { error } = await supabase.from("photos").delete().in("id", rowIds)
+  if (error) return false
+  await supabase.storage.from("photos").remove(paths)
+  return true
+}
+
+/** Rascunho do relatório de plantão (IA). Devolve null se a assistente estiver indisponível. */
+export async function askReportAi(facts: string): Promise<string | null> {
+  if (!supabase) return null
+  const { data, error } = await supabase.functions.invoke("assistant", { body: { mode: "report", facts } })
+  if (error || !data || typeof data.answer !== "string") {
+    console.error("[relatório] falha ao consultar a função:", error)
+    return null
+  }
+  return data.answer
+    .replace(/\*\*(.+?)\*\*/g, "$1")
+    .replace(/^\s*\*\s+/gm, "- ")
+    .replace(/^#+\s*/gm, "")
+    .trim()
+}
+
+/** Administração: doses de hoje que aguardam (remédio, dose e horário; sem nome do residente). */
+export async function loadPendingList(): Promise<{ id: string; medicine: string; dose: string; time: string; minutesLate: number }[]> {
+  if (!supabase) return []
+  const { data } = await supabase.from("pending_medications").select("id, medicine, dose, scheduled_for").order("scheduled_for")
+  return ((data ?? []) as any[]).map((row) => ({
+    id: row.id,
+    medicine: row.medicine,
+    dose: row.dose,
+    time: hhmm(row.scheduled_for),
+    minutesLate: Math.floor((Date.now() - new Date(row.scheduled_for).getTime()) / 60000),
+  }))
+}

@@ -506,9 +506,10 @@ create or replace function public.stamp_administration()
 returns trigger language plpgsql security definer set search_path = public as $$
 begin
   if new.status = 'administrado' and (tg_op = 'INSERT' or old.status is distinct from 'administrado') then
-    new.administered_at := now();
-    new.administered_by := auth.uid();
-    new.administered_by_name := (select full_name from public.profiles where id = auth.uid());
+    -- No app, vale quem está logado. Em scripts do SQL Editor (sem login), vale o que foi informado.
+    new.administered_by := coalesce(auth.uid(), new.administered_by);
+    new.administered_at := case when auth.uid() is null then coalesce(new.administered_at, now()) else now() end;
+    new.administered_by_name := (select full_name from public.profiles where id = new.administered_by);
   elsif new.status <> 'administrado' then
     new.administered_at := null;
     new.administered_by := null;
@@ -621,3 +622,49 @@ grant execute on function public.video_taken_slots() to authenticated;
 alter table public.video_requests drop constraint if exists video_requests_resident_id_slot_start_key;
 create unique index if not exists video_requests_active_slot
   on public.video_requests (slot_start) where status in ('solicitada', 'confirmada');
+
+-- ---------- 13. Atividades do dia --------------------------------
+alter table public.activities
+  add column if not exists registered_by_name text,
+  add column if not exists registered_at timestamptz;
+
+alter table public.activities alter column status set default 'Programada';
+update public.activities set status = 'Programada' where status = 'Prevista';
+
+-- Quem salvou e quando ficam gravados pelo banco (o app não escolhe).
+create or replace function public.stamp_activity()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if auth.uid() is not null then
+    new.created_by := coalesce(new.created_by, auth.uid());
+    new.registered_by_name := (select full_name from public.profiles where id = auth.uid());
+    new.registered_at := now();
+  else
+    new.registered_by_name := coalesce(new.registered_by_name, (select full_name from public.profiles where id = new.created_by));
+    new.registered_at := coalesce(new.registered_at, now());
+  end if;
+  return new;
+end $$;
+drop trigger if exists stamp_activity_trg on public.activities;
+create trigger stamp_activity_trg
+  before insert or update on public.activities
+  for each row execute function public.stamp_activity();
+
+-- ---------- 14. Fotos ---------------------------------------------
+alter table public.photos
+  add column if not exists group_id uuid,
+  add column if not exists author_name text;
+
+-- Nome de quem publicou, gravado pelo banco (a família lê sem acessar perfis).
+create or replace function public.stamp_photo()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  new.published_by := coalesce(auth.uid(), new.published_by);
+  new.author_name := (select full_name from public.profiles where id = new.published_by);
+  new.group_id := coalesce(new.group_id, gen_random_uuid());
+  return new;
+end $$;
+drop trigger if exists stamp_photo_trg on public.photos;
+create trigger stamp_photo_trg
+  before insert on public.photos
+  for each row execute function public.stamp_photo();
