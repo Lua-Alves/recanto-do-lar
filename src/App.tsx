@@ -1,4 +1,42 @@
 import { FormEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react"
+import {
+  MIN_PASSWORD,
+  changePassword,
+  onPasswordRecovery,
+  onSignedOut,
+  requestPasswordReset,
+  restoreSession,
+  setNewPassword,
+  signIn,
+  signOut,
+} from "./lib/auth"
+import { supabaseConfigured } from "./lib/supabase"
+import {
+  type Dose,
+  type RealResident,
+  addHouseQuestion,
+  addPrescription,
+  askAssistantAi,
+  answerHouseQuestion,
+  createVideoRequest,
+  loadTakenSlots,
+  loadVideoConfig,
+  loadVideoRequests,
+  realFutureDays,
+  saveVideoConfig,
+  updateVideoRequest,
+  groupDoses,
+  loadAlertMinutes,
+  loadHouseAnswers,
+  loadHouseQuestions,
+  loadPendingCount,
+  loadThreads,
+  saveAlertMinutes,
+  sendMessage,
+  loadResidents,
+  loadTodayDoses,
+  markDoseGiven,
+} from "./lib/data"
 
 type Screen =
   | "login"
@@ -12,9 +50,11 @@ type Screen =
   | "admin-house"
   | "profile"
   | "family-video"
+  | "family-video-request"
   | "team-photos"
   | "team-video"
 type Role = "family" | "team" | "admin"
+type Account = { name: string; email: string }
 type ContentState = "ready" | "loading" | "empty" | "error" | "offline"
 type TextSize = "normal" | "large" | "xlarge"
 type ThemePreference = "light" | "dark" | "system"
@@ -52,7 +92,7 @@ type HouseInfo = {
   updatedBy: string
   updatedAt: string
 }
-type AssistantTopic = "medicines" | "allMedicines" | "activities" | "visits" | "video" | "clinical" | "unknown"
+type AssistantTopic = "custom" | "medicines" | "allMedicines" | "activities" | "visits" | "video" | "clinical" | "unknown"
 
 type Photo = {
   id: number
@@ -64,8 +104,9 @@ type Photo = {
   day: number
 }
 type VideoStatus = "Solicitada" | "Confirmada" | "Recusada" | "Realizada"
+type VideoId = number | string
 type VideoRequest = {
-  id: number
+  id: VideoId
   resident: string
   requester: string
   dayLabel: string
@@ -388,10 +429,12 @@ function BottomNav({
   active,
   role,
   onChange,
+  badges = {},
 }: {
   active: Screen
   role: Role
   onChange: (screen: Screen) => void
+  badges?: Partial<Record<Screen, number>>
 }) {
   const items: { screen: Screen; label: string; icon: IconName }[] =
     role === "family"
@@ -434,22 +477,28 @@ function BottomNav({
         >
           <Icon name={item.icon} />
           <span>{item.label}</span>
+          {(badges[item.screen] ?? 0) > 0 && (
+            <span aria-label={`${badges[item.screen]} novidade(s)`} className="nav-badge">{badges[item.screen]}</span>
+          )}
         </button>
       ))}
     </nav>
   )
 }
 
-function Login({ onEnter }: { onEnter: (role: Role) => void }) {
+function Login({ notice, onEnter }: { notice?: string; onEnter: (role: Role, account?: Account) => void }) {
   const accounts = {
     family: { email: "familiar@recantodolar.com", password: "familia123" },
     team: { email: "equipe@recantodolar.com", password: "equipe123" },
     admin: { email: "admin@recantodolar.com", password: "admin123" },
   }
   const [role, setRole] = useState<Role>("family")
-  const [email, setEmail] = useState(accounts.family.email)
-  const [password, setPassword] = useState(accounts.family.password)
+  const [email, setEmail] = useState(supabaseConfigured ? "" : accounts.family.email)
+  const [password, setPassword] = useState(supabaseConfigured ? "" : accounts.family.password)
   const [showPassword, setShowPassword] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState("")
+  const [resetNote, setResetNote] = useState("")
   const selectRole = (nextRole: Role) => {
     setRole(nextRole)
     setEmail(accounts[nextRole].email)
@@ -471,6 +520,7 @@ function Login({ onEnter }: { onEnter: (role: Role) => void }) {
           <p>Acompanhe com tranquilidade, mesmo quando estiver longe.</p>
         </div>
 
+        {!supabaseConfigured && (
         <div className="demo-mode">
           <div className="demo-mode__heading">
             <span><Icon name="info" size={18} /></span>
@@ -521,12 +571,22 @@ function Login({ onEnter }: { onEnter: (role: Role) => void }) {
             </button>
           </div>
         </div>
+        )}
 
         <form
           className="login-form"
-          onSubmit={(event) => {
+          onSubmit={async (event) => {
             event.preventDefault()
-            onEnter(role)
+            if (!supabaseConfigured) {
+              onEnter(role)
+              return
+            }
+            setBusy(true)
+            setError("")
+            const result = await signIn(email.trim(), password)
+            setBusy(false)
+            if ("error" in result) setError(result.error)
+            else onEnter(result.role, { name: result.name, email: result.email })
           }}
         >
           <label>
@@ -537,6 +597,8 @@ function Login({ onEnter }: { onEnter: (role: Role) => void }) {
                 onChange={(event) => setEmail(event.target.value)}
                 value={email}
                 type="email"
+                autoComplete="username"
+                required
                 aria-label="E-mail"
               />
             </span>
@@ -549,6 +611,8 @@ function Login({ onEnter }: { onEnter: (role: Role) => void }) {
                 onChange={(event) => setPassword(event.target.value)}
                 value={password}
                 type={showPassword ? "text" : "password"}
+                autoComplete="current-password"
+                required
                 aria-label="Senha"
               />
               <button
@@ -561,14 +625,95 @@ function Login({ onEnter }: { onEnter: (role: Role) => void }) {
               </button>
             </span>
           </label>
-          <button className="forgot-password" type="button">Esqueci minha senha</button>
-          <button className="primary-button" type="submit">
-            Entrar
+          <button
+            className="forgot-password"
+            onClick={async () => {
+              setError("")
+              if (!supabaseConfigured) {
+                setResetNote("No modo demonstração nenhum e-mail é enviado. Na versão real, você recebe um link para criar uma nova senha.")
+                return
+              }
+              if (!email.trim()) {
+                setResetNote("")
+                setError("Digite seu e-mail acima e toque em “Esqueci minha senha” de novo.")
+                return
+              }
+              setBusy(true)
+              const result = await requestPasswordReset(email.trim())
+              setBusy(false)
+              if (result.error) {
+                setResetNote("")
+                setError(result.error)
+              } else {
+                setResetNote("Se este e-mail tiver acesso, enviamos um link para criar uma nova senha. Olhe também a caixa de spam.")
+              }
+            }}
+            type="button"
+          >
+            Esqueci minha senha
+          </button>
+          {notice && !resetNote && <p className="login-note" role="status">{notice}</p>}
+          {resetNote && <p className="login-note" role="status">{resetNote}</p>}
+          {error && <p className="login-error" role="alert">{error}</p>}
+          <button className="primary-button" disabled={busy} type="submit">
+            {busy ? "Entrando..." : "Entrar"}
             <Icon name="chevron" />
           </button>
         </form>
         <p className="access-created-note">O acesso é criado pela administração da casa.</p>
         <p className="demo-disclaimer">Dados fictícios para demonstração</p>
+      </section>
+    </main>
+  )
+}
+
+function SetPassword({ onDone }: { onDone: () => void }) {
+  const [password, setPassword] = useState("")
+  const [confirm, setConfirm] = useState("")
+  const [error, setError] = useState("")
+  const [busy, setBusy] = useState(false)
+
+  return (
+    <main className="login-screen">
+      <section className="login-content">
+        <Logo />
+        <div className="welcome">
+          <h1>Crie sua senha</h1>
+          <p>Escolha uma senha com pelo menos {MIN_PASSWORD} caracteres para acessar o Recanto do Lar.</p>
+        </div>
+        <form
+          className="login-form"
+          onSubmit={async (event) => {
+            event.preventDefault()
+            if (password.length < MIN_PASSWORD) return setError(`A senha precisa ter pelo menos ${MIN_PASSWORD} caracteres.`)
+            if (password !== confirm) return setError("As duas senhas não são iguais.")
+            setBusy(true)
+            setError("")
+            const result = await setNewPassword(password)
+            setBusy(false)
+            if (result.error) setError(result.error)
+            else onDone()
+          }}
+        >
+          <label>
+            Nova senha
+            <span className="input-wrap">
+              <Icon name="lock" size={20} />
+              <input autoComplete="new-password" onChange={(event) => setPassword(event.target.value)} type="password" value={password} aria-label="Nova senha" />
+            </span>
+          </label>
+          <label>
+            Repita a nova senha
+            <span className="input-wrap">
+              <Icon name="lock" size={20} />
+              <input autoComplete="new-password" onChange={(event) => setConfirm(event.target.value)} type="password" value={confirm} aria-label="Repita a nova senha" />
+            </span>
+          </label>
+          {error && <p className="login-error" role="alert">{error}</p>}
+          <button className="primary-button" disabled={busy} type="submit">
+            {busy ? "Salvando..." : "Salvar senha"}
+          </button>
+        </form>
       </section>
     </main>
   )
@@ -580,21 +725,22 @@ function EmergencyNotice({ phone }: { phone: string }) {
   return (
     <section className="emergency-notice">
       <div>
-        <span className="emergency-notice__icon"><Icon name="phone" size={20} /></span>
+        <span className="emergency-notice__icon"><Icon name="phone" size={18} /></span>
         <p>
-          <strong>Em caso de urgência, ligue para a casa.</strong>
-          <span>O aplicativo não é um canal de emergência. Telefone: {phone}.</span>
+          <strong>Urgência? Ligue para a casa.</strong>
+          <span>Não é canal de emergência · {phone}</span>
         </p>
       </div>
       <button
+        aria-label="Ligar para a casa"
         className="emergency-call"
         onClick={() => {
           window.location.href = `tel:${phoneHref}`
         }}
         type="button"
       >
-        <Icon name="phone" size={20} />
-        Ligar para a casa
+        <Icon name="phone" size={18} />
+        Ligar
       </button>
     </section>
   )
@@ -641,6 +787,8 @@ function StateSwitcher({
   value: ContentState
   onChange: (state: ContentState) => void
 }) {
+  // Seletor de estados é só uma ferramenta de demonstração.
+  if (supabaseConfigured) return null
   const options: { value: ContentState; label: string }[] = [
     { value: "ready", label: "Conteúdo" },
     { value: "loading", label: "Carregando" },
@@ -760,23 +908,88 @@ function Consent({ onAccept, onBack }: { onAccept: () => void; onBack: () => voi
   )
 }
 
+const givenText = (dose: Dose) =>
+  dose.status === "administrado"
+    ? `administrado${dose.administeredAt ? ` às ${dose.administeredAt}` : ""}${dose.administeredBy ? ` por ${dose.administeredBy}` : ""}`
+    : "aguardando administração"
+
+/** Linhas de medicamento para a tela da família (dados reais). */
+function medicineRows(doses: Dose[]) {
+  const colors = ["mint", "orange", "blue", "purple"]
+  return groupDoses(doses).map((group, index) => {
+    const given = group.items.filter((item) => item.status === "administrado")
+    const done = given.length === group.items.length
+    const last = given[given.length - 1]
+    return {
+      name: group.medicine,
+      dose: group.dose,
+      time: group.items.map((item) => item.time).join(" e "),
+      status: done
+        ? `Administrado${last?.administeredAt ? ` às ${last.administeredAt}` : ""}${last?.administeredBy ? ` por ${last.administeredBy}` : ""}`
+        : given.length > 0
+          ? `${given.length} de ${group.items.length} doses administradas`
+          : "Aguardando administração",
+      statusTone: done ? "done" : "pending",
+      color: colors[index % colors.length],
+    }
+  })
+}
+
 function AssistantAnswer({
   activities,
   houseInfo,
   topic,
   videoSlots,
   onOpenVideo,
+  customText,
+  doses,
 }: {
   activities: Activity[]
   houseInfo: HouseInfo
   topic: AssistantTopic
   videoSlots: string[]
   onOpenVideo: () => void
+  customText?: string
+  doses?: Dose[] | null
 }) {
   return (
     <div className="message message--assistant">
       <strong>Assistente Recanto</strong>
-      {topic === "medicines" && (
+      {topic === "custom" && <p style={{ whiteSpace: "pre-line" }}>{customText}</p>}
+      {(topic === "medicines" || topic === "allMedicines") && doses && (
+        doses.length === 0 ? (
+          <p>Ainda não há medicamentos cadastrados para hoje. A equipe pode confirmar com você.</p>
+        ) : topic === "medicines" ? (
+          <>
+            <p>Hoje a Maria toma:</p>
+            <ul className="assistant-list">
+              {doses.map((dose) => (
+                <li key={dose.id}>
+                  <Icon name={dose.status === "administrado" ? "check" : "clock"} size={16} />
+                  <span><b>{dose.medicine} {dose.dose}</b> às {dose.time} — {givenText(dose)}.</span>
+                </li>
+              ))}
+            </ul>
+          </>
+        ) : (
+          <>
+            <p>Estes são todos os medicamentos da Maria hoje:</p>
+            <ul className="assistant-list">
+              {groupDoses(doses).map((group) => (
+                <li key={`${group.medicine}-${group.dose}`}>
+                  <Icon name="medicine" size={16} />
+                  <span>
+                    <b>{group.medicine} {group.dose}</b>, {group.items.map((item) => item.time).join(" e ")} —{" "}
+                    {group.items.filter((item) => item.status === "administrado").length} de {group.items.length} doses administradas.
+                  </span>
+                </li>
+              ))}
+            </ul>
+            <p>Mudanças de dose ou dúvidas sobre o tratamento devem ser tiradas com a equipe.</p>
+          </>
+        )
+      )}
+      {topic === "medicines" && !doses && (
         <>
           <p>Hoje a Maria toma:</p>
           <ul className="assistant-list">
@@ -787,7 +1000,7 @@ function AssistantAnswer({
           </ul>
         </>
       )}
-      {topic === "allMedicines" && (
+      {topic === "allMedicines" && !doses && (
         <>
           <p>Estes são todos os medicamentos prescritos para a Maria hoje:</p>
           <ul className="assistant-list">
@@ -844,12 +1057,12 @@ function AssistantAnswer({
       )}
       {topic === "clinical" && (
         <p>
-          Essa informação precisa ser respondida pela equipe. Use o botão "Falar com a equipe" abaixo.
+          Não tenho essa informação. Já enviei sua pergunta para a equipe, que vai responder no chat com a equipe. Você será avisado aqui.
         </p>
       )}
       {topic === "unknown" && (
         <p>
-          Essa informação precisa ser respondida pela equipe. Use o botão "Falar com a equipe" abaixo.
+          Não tenho essa informação. Já enviei sua pergunta para a equipe, que vai responder no chat com a equipe. Você será avisado aqui.
         </p>
       )}
       <span className="assistant-source">
@@ -862,13 +1075,21 @@ function AssistantAnswer({
 
 function Chat({
   activities,
+  customAnswers,
   houseInfo,
   onTalkToCaregiver,
   onUnansweredQuestion,
   videoSlots,
   onOpenVideo,
+  doses,
+  teamReplyUnread,
+  askAi,
 }: {
+  askAi?: (question: string) => Promise<{ text: string; forward: boolean } | null>
+  teamReplyUnread?: boolean
+  doses?: Dose[] | null
   activities: Activity[]
+  customAnswers: Record<string, string>
   houseInfo: HouseInfo
   videoSlots: string[]
   onOpenVideo: () => void
@@ -878,7 +1099,7 @@ function Chat({
   const [message, setMessage] = useState("")
   const [screenState, setScreenState] = useState<ContentState>("ready")
   const [sentMessages, setSentMessages] = useState<
-    { question: string; topic: AssistantTopic; typing: boolean; time: string }[]
+    { question: string; topic: AssistantTopic; typing: boolean; time: string; custom?: string }[]
   >([])
 
   const getTopic = (question: string): AssistantTopic => {
@@ -893,10 +1114,52 @@ function Chat({
 
   const askAssistant = (question: string, forcedTopic?: AssistantTopic) => {
     if (!question.trim()) return
-    const topic = forcedTopic ?? getTopic(question)
+    const normalize = (text: string) =>
+      text.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, " ").trim()
+    // Palavras sem importância são ignoradas; basta a maior parte das palavras-chave coincidir.
+    const STOP = new Set("a o as os um uma de do da dos das em no na nos nas por para com e ou que se eu meu minha seu sua ele ela posso pode podem pra ao aos quero queria gostaria saber qual quais como quando onde".split(" "))
+    const stem = (word: string) => (word.length > 4 ? word.slice(0, 5) : word)
+    const keywords = (text: string) => new Set(normalize(text).split(" ").filter((word) => word && !STOP.has(word)).map(stem))
+    const sameQuestion = (asked: string) => {
+      if (normalize(asked) === normalize(question)) return true
+      const a = keywords(asked)
+      const b = keywords(question)
+      if (a.size === 0 || b.size === 0) return false
+      const common = [...a].filter((word) => b.has(word)).length
+      return common / Math.min(a.size, b.size) >= 0.75 && common / Math.max(a.size, b.size) >= 0.5
+    }
+    const answered = Object.entries(customAnswers).find(([asked]) => sameQuestion(asked))
+    // Com o Supabase ligado, a IA (Gemini) responde; vídeo continua com o botão de agendar.
+    if (askAi && !answered && (forcedTopic ?? getTopic(question)) !== "video") {
+      const aiEntry = {
+        question: question.trim(),
+        topic: "custom" as AssistantTopic,
+        custom: "",
+        typing: true,
+        time: new Date().toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" }),
+      }
+      setSentMessages((current) => [...current, aiEntry])
+      setMessage("")
+      void askAi(question.trim()).then((result) => {
+        const forward = !result || result.forward
+        const sent = " Já enviei sua pergunta para a equipe; você será avisado aqui quando responderem."
+        const text = !result
+          ? `No momento não consegui consultar a assistente.${sent}`
+          : result.forward
+            ? `${result.text}${sent}`
+            : result.text
+        if (forward) onUnansweredQuestion(question.trim())
+        setSentMessages((current) =>
+          current.map((item) => (item === aiEntry ? { ...item, typing: false, custom: text } : item)),
+        )
+      })
+      return
+    }
+    const topic: AssistantTopic = answered ? "custom" : (forcedTopic ?? getTopic(question))
     const entry = {
       question: question.trim(),
       topic,
+      custom: answered?.[1],
       typing: true,
       time: new Date().toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" }),
     }
@@ -933,14 +1196,8 @@ function Chat({
     {
       label: "Medicamentos",
       icon: "medicine" as IconName,
-      question: "Quais são os medicamentos de hoje?",
+      question: "Quais são os medicamentos da Maria?",
       topic: "medicines" as AssistantTopic,
-    },
-    {
-      label: "Todos os medicamentos",
-      icon: "medicine" as IconName,
-      question: "Quais são todos os medicamentos que ela toma?",
-      topic: "allMedicines" as AssistantTopic,
     },
     {
       label: "Atividades de hoje",
@@ -982,6 +1239,7 @@ function Chat({
               <div className="assistant-row">
                 <span className="ai-avatar"><Icon name="sparkles" size={18} /></span>
                 <AssistantAnswer
+                  doses={doses}
                   activities={activities}
                   houseInfo={houseInfo}
                   onOpenVideo={onOpenVideo}
@@ -1004,9 +1262,11 @@ function Chat({
                       </div>
                     ) : (
                       <AssistantAnswer
+                  doses={doses}
                         activities={activities}
                         houseInfo={houseInfo}
                         onOpenVideo={onOpenVideo}
+                        customText={sent.custom}
                         topic={sent.topic}
                         videoSlots={videoSlots}
                       />
@@ -1042,7 +1302,10 @@ function Chat({
       </main>
       <div className="assistant-actions">
         <button className="team-button" onClick={onTalkToCaregiver} type="button">
-          <span><Icon name="team" /> Falar com a equipe</span>
+          <span>
+            <Icon name="team" /> Falar com a equipe
+            {teamReplyUnread && <span className="unread-dot" aria-label="Nova resposta da equipe">!</span>}
+          </span>
           <Icon name="chevron" />
         </button>
       </div>
@@ -1067,7 +1330,9 @@ function Summary({
   photos,
   videoRequests,
   onOpenVideo,
+  doses,
 }: {
+  doses?: Dose[] | null
   activities: Activity[]
   houseInfo: HouseInfo
   photos: Photo[]
@@ -1075,10 +1340,11 @@ function Summary({
   onOpenVideo: () => void
 }) {
   const [selectedDay, setSelectedDay] = useState(12)
+  const [dayTab, setDayTab] = useState<"resumo" | "remedios" | "rotina" | "fotos">("resumo")
   const [screenState, setScreenState] = useState<ContentState>("ready")
   const [openPhoto, setOpenPhoto] = useState<Photo | null>(null)
   const closePhoto = useBackDismiss(openPhoto !== null, () => setOpenPhoto(null), "photo")
-  const medicines = [
+  const medicines = doses ? medicineRows(doses) : [
     { name: "Losartana", dose: "50 mg", time: "08:00 e 20:00", status: "Administrado às 08:05 por Elisa Pereira", statusTone: "done", color: "mint" },
     { name: "Vitamina D", dose: "1 cápsula", time: "09:00", status: "Administrado às 09:02 por Elisa Pereira", statusTone: "done", color: "orange" },
     { name: "Metformina", dose: "500 mg", time: "12:00", status: "Administrado às 12:03 por Elisa Pereira", statusTone: "done", color: "blue" },
@@ -1089,8 +1355,9 @@ function Summary({
       time: activity.time,
       title: activity.name,
       detail: activity.observation ?? activity.participation ?? activity.status,
-      registeredBy: activity.registeredBy,
-      registeredAt: activity.registeredAt,
+      // Atividade só programada ainda não foi feita por ninguém: sem nome do cuidador.
+      registeredBy: activity.status === "Programada" ? "" : activity.registeredBy,
+      registeredAt: activity.status === "Programada" ? "" : activity.registeredAt,
       icon: activity.status === "Realizada" ? "heart" as IconName : "clock" as IconName,
       done: activity.status === "Realizada",
     })),
@@ -1100,8 +1367,7 @@ function Summary({
   const past = PAST_DAYS.find((day) => day.n === selectedDay)
   const dayPhotos = photos.filter((photo) => photo.day === selectedDay && photo.residents.includes("Maria Silva"))
   const weekdays = [...PAST_DAYS.map((day) => ({ n: day.n, wd: day.wd, mood: day.mood })), { n: 12, wd: "sex", mood: "Muito bem" }]
-  const nextCall = videoRequests.find((request) => request.resident === "Maria Silva" && request.status === "Confirmada")
-  const pendingCall = videoRequests.find((request) => request.resident === "Maria Silva" && request.status === "Solicitada")
+  const nextCall = videoRequests.find((request) => (supabaseConfigured || request.resident === "Maria Silva") && request.status === "Confirmada")
   const weekActivities = PAST_DAYS.reduce((sum, day) => sum + day.done, 0) + completedActivities.length
   const weekPlanned = PAST_DAYS.reduce((sum, day) => sum + day.total, 0) + activities.length
 
@@ -1129,31 +1395,25 @@ function Summary({
                 ficou mais cansada e comeu um pouco menos, mas desde segunda voltou ao normal.
               </p>
               <div className="summary-metrics summary-metrics--four">
-                <div><span>Humor bom</span><strong>6 de 7 dias</strong></div>
-                <div><span>Boa alimentação</span><strong>6 de 7 dias</strong></div>
-                <div><span>Doses dadas</span><strong>27 de 28</strong></div>
-                <div><span>Atividades feitas</span><strong>{weekActivities} de {weekPlanned}</strong></div>
+                <div><span>Humor bom</span><strong>6/7</strong></div>
+                <div><span>Alimentação</span><strong>6/7</strong></div>
+                <div><span>Doses</span><strong>27/28</strong></div>
+                <div><span>Atividades</span><strong>{weekActivities}/{weekPlanned}</strong></div>
               </div>
             </section>
 
             <section className="video-card">
               <span className="feature-icon"><Icon name="video" /></span>
               <div>
-                <h2>Videochamada</h2>
-                <span>
-                  {nextCall
-                    ? `Confirmada: ${nextCall.dayLabel} às ${nextCall.time}`
-                    : pendingCall
-                      ? `Aguardando a equipe: ${pendingCall.dayLabel} às ${pendingCall.time}`
-                      : "Peça um horário para ver a Maria"}
-                </span>
+                <h2>{nextCall ? "Videochamada confirmada" : "Videochamada"}</h2>
+                <span>{nextCall ? `${nextCall.dayLabel} às ${nextCall.time}` : "Peça um horário à equipe"}</span>
               </div>
-              <button onClick={onOpenVideo} type="button">{nextCall || pendingCall ? "Ver" : "Agendar"}</button>
+              <button onClick={onOpenVideo} type="button">{nextCall ? "Ver" : "Agendar"}</button>
             </section>
 
             <div className="day-picker-heading">
               <h2>Dia a dia</h2>
-              <span>Toque em um dia para ver o que aconteceu</span>
+              <span>Toque em um dia</span>
             </div>
             <div className="day-strip" role="group" aria-label="Últimos 7 dias">
               {weekdays.map((day) => (
@@ -1170,6 +1430,20 @@ function Summary({
               ))}
             </div>
 
+            <div className="tab-switch" role="group" aria-label="Detalhes do dia">
+              {([
+                ["resumo", "Resumo"],
+                ["remedios", "Remédios"],
+                ["rotina", "Rotina"],
+                ["fotos", "Fotos"],
+              ] as const).map(([value, label]) => (
+                <button aria-pressed={dayTab === value} key={value} onClick={() => setDayTab(value)} type="button">
+                  {label}
+                </button>
+              ))}
+            </div>
+
+            {dayTab === "resumo" && (
             <section className="section-block">
               <div className="section-title">
                 <div><h2>{isToday ? "Hoje" : `${past?.wd} ${selectedDay}`}</h2><span>Resumo do dia</span></div>
@@ -1192,12 +1466,17 @@ function Summary({
                 <div><span>Atividades</span><strong>{isToday ? `${completedActivities.length} de ${activities.length}` : `${past?.done} de ${past?.total}`}</strong></div>
               </div>
             </section>
+            )}
 
+            {dayTab === "remedios" && (
             <section className="section-block">
               <div className="section-title">
-                <div><h2>Medicamentos</h2><span>{isToday ? "3 medicamentos · 3 de 4 doses dadas" : `${past?.given} de ${past?.doses} doses administradas`}</span></div>
+                <div><h2>Medicamentos</h2><span>{isToday ? (doses ? `${medicines.length} medicamentos · ${doses.filter((dose) => dose.status === "administrado").length} de ${doses.length} doses dadas` : "3 medicamentos · 3 de 4 doses dadas") : `${past?.given} de ${past?.doses} doses administradas`}</span></div>
               </div>
               {isToday ? (
+                medicines.length === 0 ? (
+                  <p className="day-text"><Icon name="info" size={16} /> <span>Nenhum medicamento previsto para hoje.</span></p>
+                ) : (
                 <div className="medicine-list">
                   {medicines.map((medicine) => (
                     <article className="medicine-row" key={medicine.name}>
@@ -1214,13 +1493,16 @@ function Summary({
                     </article>
                   ))}
                 </div>
+                )
               ) : (
                 <p className="day-text">
                   <Icon name="check" size={16} /> <span>Todas as doses do dia foram administradas pela equipe.</span>
                 </p>
               )}
             </section>
+            )}
 
+            {dayTab === "rotina" && (
             <section className="section-block">
               <div className="section-title"><div><h2>{isToday ? "Rotina de hoje" : "Rotina do dia"}</h2><span>Registros da equipe</span></div></div>
               <div className="timeline">
@@ -1242,14 +1524,16 @@ function Summary({
                     <div>
                       <strong>{item.title}</strong>
                       <span className="timeline-meta">
-                        {item.detail} · {item.registeredBy}, {item.registeredAt}
+                        {item.registeredBy ? `${item.detail} · ${item.registeredBy}, ${item.registeredAt}` : item.detail}
                       </span>
                     </div>
                   </article>
                 ))}
               </div>
             </section>
+            )}
 
+            {dayTab === "fotos" && (
             <section className="section-block">
               <div className="section-title"><div><h2>Fotos</h2><span>Só aparecem fotos em que a Maria está</span></div></div>
               {dayPhotos.length === 0 ? (
@@ -1258,6 +1542,7 @@ function Summary({
                 <PhotoGrid photos={dayPhotos} onOpen={setOpenPhoto} />
               )}
             </section>
+            )}
           </>
         )}
       </main>
@@ -1266,7 +1551,9 @@ function Summary({
   )
 }
 
-const residents = [
+type ResidentCard = { initials: string; name: string; room: string; status: string; color: string; pendingCount: number; id?: string }
+
+const residents: ResidentCard[] = [
   { initials: "MS", name: "Maria Silva", room: "Quarto 12", status: "Atualizado há 20 min", color: "mint", pendingCount: 1 },
   { initials: "JP", name: "João Pereira", room: "Quarto 08", status: "Atualizado há 35 min", color: "blue", pendingCount: 0 },
   { initials: "AL", name: "Ana Lourdes", room: "Quarto 15", status: "Atualizado há 1 h", color: "orange", pendingCount: 0 },
@@ -1322,7 +1609,7 @@ function ResidentConversation({
               >
                 {residentMessage.text}
                 <span>
-                  {residentMessage.sender === "family" ? "Carla" : "Elisa"} · agora
+                  {residentMessage.sender === "family" ? "Carla" : residentMessage.sender === "admin" ? "Administração" : "Elisa"} · agora
                 </span>
               </div>
             )
@@ -1352,7 +1639,15 @@ function TeamPanel({
   onMarkAsRead,
   onSendMessage,
   onUpdateActivity,
+  realResidents,
+  doses,
+  onMarkDose,
+  onAddPrescription,
 }: {
+  realResidents: RealResident[]
+  doses: Dose[]
+  onMarkDose: (doseId: string) => Promise<boolean>
+  onAddPrescription: (residentId: string, medicine: string, dose: string, time: string) => Promise<boolean>
   activitiesByResident: Record<string, Activity[]>
   conversations: Record<string, ResidentMessage[]>
   onAddActivity: (residentName: string, name: string, time: string) => void
@@ -1362,7 +1657,12 @@ function TeamPanel({
   onUpdateActivity: (residentName: string, id: number, updates: Partial<Activity>) => void
 }) {
   const [query, setQuery] = useState("")
-  const [selected, setSelected] = useState<(typeof residents)[number] | null>(null)
+  const [selected, setSelected] = useState<ResidentCard | null>(null)
+  const [rxName, setRxName] = useState("")
+  const [rxDose, setRxDose] = useState("")
+  const [rxTime, setRxTime] = useState("08:00")
+  const [rxError, setRxError] = useState("")
+  const [busyDose, setBusyDose] = useState("")
   const [profilePage, setProfilePage] = useState<"record" | "chat" | "report">("record")
   const [saved, setSaved] = useState(false)
   const [notesSaved, setNotesSaved] = useState(false)
@@ -1387,9 +1687,27 @@ function TeamPanel({
     [],
   )
   const quickRecords = ["Comeu bem", "Comeu pouco", "Recusou", "Dormiu bem", "Agitado"]
+  const residentList: ResidentCard[] = useMemo(
+    () =>
+      supabaseConfigured
+        ? realResidents.map((resident) => {
+            const pending = doses.filter((dose) => dose.residentId === resident.id && dose.status === "aguardando").length
+            return {
+              id: resident.id,
+              initials: resident.initials,
+              name: resident.name,
+              room: resident.room,
+              color: resident.color,
+              pendingCount: pending,
+              status: pending > 0 ? "Há doses a administrar hoje" : "Medicação em dia",
+            }
+          })
+        : residents,
+    [realResidents, doses],
+  )
   const filtered = useMemo(
     () =>
-      residents
+      residentList
         .filter((resident) => resident.name.toLowerCase().includes(query.toLowerCase()))
         .filter((resident) => residentFilter === "all" || resident.pendingCount > 0)
         .sort((a, b) =>
@@ -1398,7 +1716,7 @@ function TeamPanel({
             : b.pendingCount - a.pendingCount ||
               Number(unreadConversations[b.name]) - Number(unreadConversations[a.name]),
         ),
-    [query, residentFilter, sortOrder, unreadConversations],
+    [query, residentFilter, sortOrder, unreadConversations, residentList],
   )
 
   useEffect(() => {
@@ -1575,6 +1893,80 @@ function TeamPanel({
             <Icon name="chevron" />
           </button>
 
+          {supabaseConfigured && selected.id && (
+            <section className="form-card">
+              <div className="card-heading">
+                <span className="feature-icon"><Icon name="medicine" /></span>
+                <div><span>Hoje</span><h2>Medicação</h2></div>
+              </div>
+              {doses.filter((dose) => dose.residentId === selected.id).length === 0 && (
+                <p className="record-author">Nenhum medicamento previsto para hoje.</p>
+              )}
+              <div className="medicine-list">
+                {doses
+                  .filter((dose) => dose.residentId === selected.id)
+                  .map((dose) => (
+                    <article className="medicine-row" key={dose.id}>
+                      <span className="medicine-icon medicine-icon--mint"><Icon name="medicine" /></span>
+                      <div>
+                        <strong>{dose.medicine}</strong>
+                        <span>{dose.dose} · {dose.time}</span>
+                        {dose.status === "administrado" ? (
+                          <small className="medicine-status medicine-status--done">
+                            <Icon name="check" size={16} />
+                            Administrado{dose.administeredAt ? ` às ${dose.administeredAt}` : ""}
+                            {dose.administeredBy ? ` por ${dose.administeredBy}` : ""}
+                          </small>
+                        ) : (
+                          <button
+                            className="outline-button"
+                            disabled={busyDose === dose.id}
+                            onClick={async () => {
+                              setBusyDose(dose.id)
+                              await onMarkDose(dose.id)
+                              setBusyDose("")
+                            }}
+                            type="button"
+                          >
+                            <Icon name="check" />
+                            {busyDose === dose.id ? "Registrando..." : "Administrado"}
+                          </button>
+                        )}
+                      </div>
+                    </article>
+                  ))}
+              </div>
+              <label>Novo medicamento<input onChange={(event) => setRxName(event.target.value)} placeholder="Ex.: Losartana" value={rxName} /></label>
+              <div className="field-row">
+                <label>Dose<input onChange={(event) => setRxDose(event.target.value)} placeholder="Ex.: 50 mg" value={rxDose} /></label>
+                <label>Horário<input onChange={(event) => setRxTime(event.target.value)} type="time" value={rxTime} /></label>
+              </div>
+              {rxError && <p className="login-error" role="alert">{rxError}</p>}
+              <button
+                className="outline-button"
+                onClick={async () => {
+                  if (!rxName.trim() || !rxDose.trim()) {
+                    setRxError("Preencha o nome e a dose do medicamento.")
+                    return
+                  }
+                  setRxError("")
+                  const ok = await onAddPrescription(selected.id!, rxName, rxDose, rxTime)
+                  if (ok) {
+                    setRxName("")
+                    setRxDose("")
+                  } else {
+                    setRxError("Não foi possível salvar. Tente novamente.")
+                  }
+                }}
+                type="button"
+              >
+                <Icon name="plus" />
+                Adicionar medicamento
+              </button>
+            </section>
+          )}
+
+          {!supabaseConfigured && (
           <section className="form-card">
             <div className="card-heading">
               <span className="feature-icon"><Icon name="medicine" /></span>
@@ -1596,6 +1988,7 @@ function TeamPanel({
               </p>
             )}
           </section>
+          )}
 
           <section className="form-card activity-card">
             <div className="card-heading">
@@ -1655,7 +2048,7 @@ function TeamPanel({
                     value={activity.observation ?? ""}
                   />
                   <small>
-                    {activity.registeredBy} · {activity.registeredAt}
+                    {activity.status === "Programada" ? "Ainda não registrada" : `${activity.registeredBy} · ${activity.registeredAt}`}
                   </small>
                 </article>
               ))}
@@ -1872,7 +2265,6 @@ function TeamPanel({
             </button>
           ))}
         </div>
-        <button className="floating-add" type="button"><Icon name="plus" /> Novo residente</button>
       </main>
     </>
   )
@@ -1912,32 +2304,128 @@ function Caregiver({
   )
 }
 
+// Mensagens seguidas da família no fim da conversa, ainda sem resposta da equipe.
+function pendingFamilyMessages(messages: ResidentMessage[]): string[] {
+  const pending: string[] = []
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index].sender !== "family") break
+    pending.unshift(messages[index].text)
+  }
+  return pending
+}
+
 function AdminDashboard({
   alertMinutes,
-  onOpenHouse,
+  conversations,
+  onAnswerQuestion,
+  onReply,
   pendingVideo,
   unansweredQuestions,
   unreadConversations,
+  pendingMedicines,
+  overdueThreads,
 }: {
+  overdueThreads?: { resident: string; minutes: number }[]
+  pendingMedicines?: number
   alertMinutes: 10 | 15 | 30
+  conversations: Record<string, ResidentMessage[]>
+  onAnswerQuestion: (question: string, answer: string) => void
+  onReply: (resident: string, text: string) => void
   pendingVideo: number
-  onOpenHouse: () => void
   unansweredQuestions: string[]
   unreadConversations: Record<string, boolean>
 }) {
-  const unansweredJoao = unreadConversations["João Pereira"] && 18 >= alertMinutes
+  const overdue =
+    overdueThreads ??
+    (unreadConversations["João Pereira"] && 18 >= alertMinutes ? [{ resident: "João Pereira", minutes: 18 }] : [])
+  const ago = (minutes: number) => (minutes >= 60 ? `há ${Math.floor(minutes / 60)} h ${minutes % 60} min` : `há ${minutes} min`)
   const [selectedAlert, setSelectedAlert] = useState<{
     resident: string
     involved: string
     time: string
     elapsed: string
     status: string
+    canReply?: boolean
   } | null>(null)
+  const [adminTab, setAdminTab] = useState<"alertas" | "perguntas" | "historico">("alertas")
+  const [replying, setReplying] = useState(false)
+  const [replyText, setReplyText] = useState("")
+  const [replySent, setReplySent] = useState(false)
+  const [answeringQuestion, setAnsweringQuestion] = useState<string | null>(null)
+  const [answerText, setAnswerText] = useState("")
+  const [answerSent, setAnswerSent] = useState(false)
   const closeAlert = useBackDismiss(
     selectedAlert !== null,
-    () => setSelectedAlert(null),
+    () => {
+      setSelectedAlert(null)
+      setReplying(false)
+      setReplyText("")
+      setReplySent(false)
+    },
     "admin-alert-detail",
   )
+  const closeQuestion = useBackDismiss(
+    answeringQuestion !== null,
+    () => {
+      setAnsweringQuestion(null)
+      setAnswerText("")
+      setAnswerSent(false)
+    },
+    "admin-question",
+  )
+
+  if (answeringQuestion !== null) {
+    return (
+      <>
+        <TopBar
+          eyebrow="Administração da casa"
+          title="Responder pergunta"
+          avatar="MA"
+          onBack={closeQuestion}
+        />
+        <main className="screen-content admin-screen">
+          <div className="alert-details alert-details--page">
+            <dl>
+              <div><dt>Pergunta de uma família</dt><dd>{answeringQuestion}</dd></div>
+            </dl>
+            {answerSent ? (
+              <>
+                <p className="inline-toast" role="status">
+                  <Icon name="check" size={18} /> Resposta salva. A assistente já pode usá-la.
+                </p>
+                <button className="primary-button" onClick={closeQuestion} type="button">
+                  Voltar ao painel
+                </button>
+              </>
+            ) : (
+              <>
+                <label className="admin-field">
+                  Sua resposta
+                  <textarea
+                    onChange={(event) => setAnswerText(event.target.value)}
+                    placeholder="Escreva a informação que a assistente deve passar às famílias"
+                    rows={4}
+                    value={answerText}
+                  />
+                </label>
+                <button
+                  className="primary-button"
+                  disabled={!answerText.trim()}
+                  onClick={() => {
+                    onAnswerQuestion(answeringQuestion, answerText.trim())
+                    setAnswerSent(true)
+                  }}
+                  type="button"
+                >
+                  Salvar resposta
+                </button>
+              </>
+            )}
+          </div>
+        </main>
+      </>
+    )
+  }
 
   if (selectedAlert) {
     return (
@@ -1953,11 +2441,57 @@ function AdminDashboard({
             <dl>
               {selectedAlert.resident && <div><dt>Residente</dt><dd>{selectedAlert.resident}</dd></div>}
               <div><dt>Envolvidos</dt><dd>{selectedAlert.involved}</dd></div>
-              <div><dt>Horário</dt><dd>{selectedAlert.time}</dd></div>
+              {selectedAlert.time && <div><dt>Horário</dt><dd>{selectedAlert.time}</dd></div>}
               <div><dt>Tempo</dt><dd>{selectedAlert.elapsed}</dd></div>
-              <div><dt>Status</dt><dd>{selectedAlert.status}</dd></div>
+              <div><dt>Status</dt><dd>{replySent ? "Respondida pela administração" : selectedAlert.status}</dd></div>
             </dl>
-            <p><Icon name="lock" size={18} />A administração vê apenas informações do alerta, não o conteúdo das conversas. O nome do residente só aparece em medicamentos já administrados.</p>
+            {selectedAlert.canReply ? (
+              <>
+                <div className="alert-message">
+                  <strong>Mensagem da família</strong>
+                  {pendingFamilyMessages(conversations[selectedAlert.resident] ?? []).map((text, index) => (
+                    <p key={`${text}-${index}`}>{text}</p>
+                  ))}
+                </div>
+                {replySent ? (
+                  <p className="inline-toast" role="status">
+                    <Icon name="check" size={18} /> Resposta enviada. A família já pode ver.
+                  </p>
+                ) : replying ? (
+                  <>
+                    <label className="admin-field">
+                      Sua resposta
+                      <textarea
+                        onChange={(event) => setReplyText(event.target.value)}
+                        placeholder="Escreva a resposta para a família"
+                        rows={4}
+                        value={replyText}
+                      />
+                    </label>
+                    <button
+                      className="primary-button"
+                      disabled={!replyText.trim()}
+                      onClick={() => {
+                        onReply(selectedAlert.resident, replyText.trim())
+                        setReplySent(true)
+                      }}
+                      type="button"
+                    >
+                      Enviar resposta
+                    </button>
+                  </>
+                ) : (
+                  <button className="primary-button" onClick={() => setReplying(true)} type="button">
+                    <Icon name="chat" /> Responder à família
+                  </button>
+                )}
+              </>
+            ) : null}
+            <p><Icon name="lock" size={18} />
+              {selectedAlert.canReply
+                ? "A administração só acessa o conteúdo de mensagens que ficaram sem resposta acima do tempo configurado."
+                : "A administração vê apenas informações do alerta. O nome do residente só aparece em medicamentos já administrados."}
+            </p>
           </div>
         </main>
       </>
@@ -1971,41 +2505,57 @@ function AdminDashboard({
         <section className="admin-summary-grid">
           <article className="admin-summary-card admin-summary-card--pending">
             <span><Icon name="medicine" /></span>
-            <div><strong>3</strong><h2>Medicamentos aguardando administração</h2></div>
+            <div><h2>Medicamentos aguardando administração: <strong>{pendingMedicines ?? 3}</strong></h2></div>
             <small>Aguardando a equipe de plantão</small>
           </article>
+          {!supabaseConfigured && (
           <article className="admin-summary-card">
             <span><Icon name="clock" /></span>
-            <div><strong>2</strong><h2>Sem registro há mais de 3 horas</h2></div>
+            <div><h2>Sem registro há mais de 3 horas: <strong>2</strong></h2></div>
             <small>Ana Lourdes · Roberto Santos</small>
           </article>
+          )}
           <article className="admin-summary-card admin-summary-card--alert">
             <span><Icon name="chat" /></span>
-            <div><strong>{unansweredJoao ? 1 : 0}</strong><h2>Mensagens sem resposta</h2></div>
-            <small>{unansweredJoao ? "João Pereira · há 18 min" : "Nenhuma acima do tempo configurado"}</small>
+            <div><h2>Mensagens sem resposta: <strong>{overdue.length}</strong></h2></div>
+            <small>{overdue.length > 0 ? overdue.map((item) => `${item.resident} · ${ago(item.minutes)}`).join(" · ") : "Nenhuma acima do tempo configurado"}</small>
           </article>
           <article className="admin-summary-card">
             <span><Icon name="video" /></span>
-            <div><strong>{pendingVideo}</strong><h2>Pedidos de videochamada</h2></div>
+            <div><h2>Pedidos de videochamada: <strong>{pendingVideo}</strong></h2></div>
             <small>{pendingVideo > 0 ? "Aguardando resposta da equipe" : "Nenhum pedido pendente"}</small>
           </article>
         </section>
 
+        <div className="tab-switch tab-switch--three" role="group" aria-label="Seções do painel">
+          {([
+            ["alertas", "Alertas"],
+            ["perguntas", `Perguntas (${unansweredQuestions.length})`],
+            ["historico", "Histórico"],
+          ] as const).map(([value, label]) => (
+            <button aria-pressed={adminTab === value} key={value} onClick={() => setAdminTab(value)} type="button">
+              {label}
+            </button>
+          ))}
+        </div>
+
+        {adminTab === "alertas" && (
         <section className="admin-section">
           <div className="admin-section__title"><h2>Alertas</h2><span>Somente para consulta</span></div>
           <div className="admin-alert-list">
-            {unansweredJoao && (
-              <article>
+            {overdue.map((item) => (
+              <article key={item.resident}>
                 <span className="admin-alert-icon"><Icon name="chat" /></span>
-                <div><strong>Mensagem da família de João Pereira</strong><small>Sem resposta há 18 min</small></div>
+                <div><strong>Mensagem da família de {item.resident}</strong><small>Sem resposta {ago(item.minutes)}</small></div>
                 <button
                   onClick={() =>
                     setSelectedAlert({
-                      resident: "João Pereira",
-                      involved: "Paulo Pereira e Elisa Pereira",
-                      time: "14:42",
-                      elapsed: "há 18 min",
+                      resident: item.resident,
+                      involved: supabaseConfigured ? "Família e equipe de plantão" : "Paulo Pereira e Elisa Pereira",
+                      time: supabaseConfigured ? "" : "14:42",
+                      elapsed: ago(item.minutes),
                       status: "Aguardando resposta",
+                      canReply: true,
                     })
                   }
                   type="button"
@@ -2013,7 +2563,11 @@ function AdminDashboard({
                   Ver
                 </button>
               </article>
+            ))}
+            {overdue.length === 0 && supabaseConfigured && (
+              <p className="video-empty">Nenhum alerta no momento.</p>
             )}
+            {!supabaseConfigured && (
             <article>
               <span className="admin-alert-icon admin-alert-icon--pending"><Icon name="clock" /></span>
               <div><strong>Medicamento aguardando administração</strong><small>Prevista para 14:00 · há 20 min</small></div>
@@ -2032,31 +2586,41 @@ function AdminDashboard({
                 Ver
               </button>
             </article>
+            )}
           </div>
         </section>
+        )}
 
+        {adminTab === "historico" && (
         <section className="admin-section">
+          {supabaseConfigured ? (
+            <p className="video-empty">O histórico de alterações aparece aqui.</p>
+          ) : (<>
           <div className="admin-section__title"><h2>Histórico de edições</h2></div>
           <div className="admin-history">
             <p><Icon name="profile" /><span><strong>Elisa Pereira</strong> corrigiu o horário da Metformina de Maria Silva (12:00 → 12:10) <small>às 12:40</small></span></p>
             <p><Icon name="profile" /><span><strong>Elisa Pereira</strong> marcou a oficina de pintura de Maria Silva como Realizada <small>às 11:05</small></span></p>
           </div>
+          </>)}
         </section>
+        )}
 
+        {adminTab === "perguntas" && (
         <section className="admin-section">
           <div className="admin-section__title"><h2>Perguntas sem resposta da assistente</h2></div>
           <div className="unanswered-list">
-            {(unansweredQuestions.length > 0
-              ? unansweredQuestions
-              : ["A Maria pode receber uma visita pela manhã?"]
-            ).map((question, index) => (
+            {unansweredQuestions.length === 0 && (
+              <p className="video-empty">Nenhuma pergunta sem resposta.</p>
+            )}
+            {unansweredQuestions.map((question, index) => (
               <article key={`${question}-${index}`}>
                 <div><Icon name="info" /><span>{question}</span></div>
-                <button onClick={onOpenHouse} type="button">Cadastrar informação</button>
+                <button onClick={() => setAnsweringQuestion(question)} type="button">Responder</button>
               </article>
             ))}
           </div>
         </section>
+        )}
 
         <p className="admin-readonly-note">
           <Icon name="lock" size={18} />
@@ -2918,6 +3482,7 @@ function AdminHouse({
   const [saved, setSaved] = useState(false)
   const [videoDraft, setVideoDraft] = useState(videoConfig)
   const [videoSaved, setVideoSaved] = useState(false)
+  const [houseTab, setHouseTab] = useState<"casa" | "video">("casa")
   const changeVideo = (patch: Partial<VideoConfig>) => {
     setVideoDraft((current) => ({ ...current, ...patch }))
     setVideoSaved(false)
@@ -2928,6 +3493,12 @@ function AdminHouse({
     <>
       <TopBar eyebrow="Administração da casa" title="Informações da casa" avatar="MA" />
       <main className="screen-content admin-screen admin-screen--house">
+        <div className="tab-switch tab-switch--two" role="group" aria-label="Seções da casa">
+          <button aria-pressed={houseTab === "casa"} onClick={() => setHouseTab("casa")} type="button">Casa e visitas</button>
+          <button aria-pressed={houseTab === "video"} onClick={() => setHouseTab("video")} type="button">Videochamada</button>
+        </div>
+
+        {houseTab === "casa" && (
         <section className="admin-house-card">
           <div className="card-heading">
             <span className="feature-icon"><Icon name="home" /></span>
@@ -3001,7 +3572,9 @@ function AdminHouse({
             respostas da assistente.
           </p>
         </section>
+        )}
 
+        {houseTab === "video" && (
         <section className="admin-house-card">
           <div className="card-heading">
             <span className="feature-icon"><Icon name="video" /></span>
@@ -3056,7 +3629,7 @@ function AdminHouse({
           <div className="alert-time-setting">
             <span>Bloquear datas (feriados, eventos)</span>
             <div className="day-toggle-row day-toggle-row--wrap">
-              {FUTURE_DAYS.map((day) => {
+              {futureDays().map((day) => {
                 const label = `${day.wd} ${day.n}`
                 return (
                   <button
@@ -3094,12 +3667,14 @@ function AdminHouse({
             chamada. A administração só define quando as chamadas podem acontecer.
           </p>
         </section>
+        )}
       </main>
     </>
   )
 }
 
 function Profile({
+  account,
   onExit,
   role,
   textSize,
@@ -3107,6 +3682,7 @@ function Profile({
   themePreference,
   onThemeChange,
 }: {
+  account: Account | null
   onExit: () => void
   role: Role
   textSize: TextSize
@@ -3116,10 +3692,26 @@ function Profile({
 }) {
   const isFamily = role === "family"
   const isTeam = role === "team"
-  const userInitials = isFamily ? "CS" : isTeam ? "EP" : "MA"
+  const fallbackName = isFamily ? "Carla Souza" : isTeam ? "Elisa Pereira" : "Marta Andrade"
+  const fallbackEmail = isFamily
+    ? "familiar@recantodolar.com"
+    : isTeam
+      ? "equipe@recantodolar.com"
+      : "admin@recantodolar.com"
+  const displayName = account?.name || fallbackName
+  const displayEmail = account?.email || fallbackEmail
+  const userInitials = account?.name
+    ? account.name.split(/\s+/).filter(Boolean).slice(0, 2).map((part) => part[0].toUpperCase()).join("")
+    : isFamily ? "CS" : isTeam ? "EP" : "MA"
   const [dailySummary, setDailySummary] = useState(true)
   const [teamMessage, setTeamMessage] = useState(true)
-  const [profilePage, setProfilePage] = useState<"main" | "text" | "notifications" | "appearance">("main")
+  const [profilePage, setProfilePage] = useState<"main" | "text" | "notifications" | "appearance" | "password">("main")
+  const [pwCurrent, setPwCurrent] = useState("")
+  const [pwNew, setPwNew] = useState("")
+  const [pwConfirm, setPwConfirm] = useState("")
+  const [pwError, setPwError] = useState("")
+  const [pwDone, setPwDone] = useState(false)
+  const [pwBusy, setPwBusy] = useState(false)
   const closeProfilePage = useBackDismiss(
     profilePage !== "main",
     () => setProfilePage("main"),
@@ -3156,6 +3748,66 @@ function Profile({
               <span>Prévia</span>
               <p>Maria está bem e participou das atividades de hoje.</p>
             </div>
+          </section>
+        </main>
+      </>
+    )
+  }
+
+  if (profilePage === "password") {
+    const submitPassword = async (event: FormEvent) => {
+      event.preventDefault()
+      setPwError("")
+      if (pwNew.length < MIN_PASSWORD) return setPwError(`A nova senha precisa ter pelo menos ${MIN_PASSWORD} caracteres.`)
+      if (pwNew !== pwConfirm) return setPwError("As duas senhas novas não são iguais.")
+      if (pwNew === pwCurrent) return setPwError("A nova senha precisa ser diferente da atual.")
+      if (!supabaseConfigured) {
+        setPwDone(true)
+        return
+      }
+      setPwBusy(true)
+      const result = await changePassword(displayEmail, pwCurrent, pwNew)
+      setPwBusy(false)
+      if (result.error) setPwError(result.error)
+      else setPwDone(true)
+    }
+    return (
+      <>
+        <TopBar avatar={userInitials} eyebrow="Perfil" title="Alterar senha" onBack={closeProfilePage} />
+        <main className="screen-content profile-content profile-subpage">
+          <section className="profile-section">
+            <div className="profile-section__title">
+              <Icon name="lock" />
+              <div><h3>Alterar senha</h3><span>Você mesmo troca a sua senha, sem precisar da administração.</span></div>
+            </div>
+            {pwDone ? (
+              <>
+                <p className="inline-toast" role="status">
+                  <Icon name="check" size={18} /> Senha alterada com sucesso.
+                </p>
+                <button className="primary-button" onClick={closeProfilePage} type="button">Voltar ao perfil</button>
+              </>
+            ) : (
+              <form className="admin-field-grid" onSubmit={submitPassword}>
+                <label className="admin-field">
+                  Senha atual
+                  <input autoComplete="current-password" onChange={(event) => setPwCurrent(event.target.value)} required type="password" value={pwCurrent} />
+                </label>
+                <label className="admin-field">
+                  Nova senha
+                  <input autoComplete="new-password" onChange={(event) => setPwNew(event.target.value)} required type="password" value={pwNew} />
+                  <small>Pelo menos {MIN_PASSWORD} caracteres.</small>
+                </label>
+                <label className="admin-field">
+                  Repita a nova senha
+                  <input autoComplete="new-password" onChange={(event) => setPwConfirm(event.target.value)} required type="password" value={pwConfirm} />
+                </label>
+                {pwError && <p className="login-error" role="alert">{pwError}</p>}
+                <button className="primary-button" disabled={pwBusy} type="submit">
+                  {pwBusy ? "Salvando..." : "Salvar nova senha"}
+                </button>
+              </form>
+            )}
           </section>
         </main>
       </>
@@ -3252,24 +3904,18 @@ function Profile({
           initials={userInitials}
           size="large"
           tone="mint"
-          label={isFamily ? "Carla Souza" : isTeam ? "Elisa Pereira" : "Marta Andrade"}
+          label={displayName}
         />
-        <h2>{isFamily ? "Carla Souza" : isTeam ? "Elisa Pereira" : "Marta Andrade"}</h2>
+        <h2>{displayName}</h2>
         <p>{isFamily ? "Familiar responsável" : isTeam ? "Equipe de cuidados" : "Coordenadora"}</p>
         <dl className="profile-details">
           <div>
             <dt>Nome</dt>
-            <dd>{isFamily ? "Carla Souza" : isTeam ? "Elisa Pereira" : "Marta Andrade"}</dd>
+            <dd>{displayName}</dd>
           </div>
           <div>
             <dt>E-mail</dt>
-            <dd>
-              {isFamily
-                ? "familiar@recantodolar.com"
-                : isTeam
-                  ? "equipe@recantodolar.com"
-                  : "admin@recantodolar.com"}
-            </dd>
+            <dd>{displayEmail}</dd>
           </div>
           <div>
             <dt>{isFamily ? "Pessoa acompanhada" : isTeam ? "Horário de trabalho" : "Cargo"}</dt>
@@ -3299,6 +3945,19 @@ function Profile({
           >
             <span><Icon name="moon" /> Aparência</span><Icon name="chevron" />
           </button>
+          <button
+            onClick={() => {
+              setPwCurrent("")
+              setPwNew("")
+              setPwConfirm("")
+              setPwError("")
+              setPwDone(false)
+              setProfilePage("password")
+            }}
+            type="button"
+          >
+            <span><Icon name="lock" /> Alterar senha</span><Icon name="chevron" />
+          </button>
         </section>
         {isTeam && (
           <div className="personal-account-note personal-account-note--profile">
@@ -3315,7 +3974,7 @@ function Profile({
 
 /* ===================== Etapas 2, 3 e 4: histórico, fotos e videochamada ===================== */
 
-const FUTURE_DAYS = [
+const DEMO_FUTURE_DAYS = [
   { n: 13, wd: "sáb", idx: 6 },
   { n: 14, wd: "dom", idx: 0 },
   { n: 15, wd: "seg", idx: 1 },
@@ -3345,13 +4004,15 @@ function nowTime() {
   return new Date().toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" })
 }
 
+const futureDays = () => (supabaseConfigured ? realFutureDays() : DEMO_FUTURE_DAYS)
+
 function generateSlots(config: VideoConfig, requests: VideoRequest[]) {
   const taken = new Set(
     requests
       .filter((request) => request.status === "Solicitada" || request.status === "Confirmada")
       .map((request) => `${request.dayLabel}|${request.time}`),
   )
-  return FUTURE_DAYS.filter((day) => config.days.includes(day.idx))
+  return futureDays().filter((day) => config.days.includes(day.idx))
     .map((day) => ({ label: `${day.wd} ${day.n}`, times: [] as string[] }))
     .filter((day) => !config.blocked.includes(day.label))
     .map((day) => {
@@ -3478,35 +4139,21 @@ function StatusBadge({ status }: { status: VideoStatus }) {
 }
 
 function FamilyVideo({
-  config,
   requests,
+  onNewRequest,
   onRequest,
   onCancel,
   onJoin,
   onBack,
 }: {
-  config: VideoConfig
   requests: VideoRequest[]
+  onNewRequest: () => void
   onRequest: (dayLabel: string, time: string, note: string) => void
-  onCancel: (id: number) => void
+  onCancel: (id: VideoId) => void
   onJoin: (request: VideoRequest) => void
   onBack: () => void
 }) {
-  const slots = generateSlots(config, requests)
-  const [dayLabel, setDayLabel] = useState("")
-  const [time, setTime] = useState("")
-  const [note, setNote] = useState("")
-  const [sent, setSent] = useState(false)
-  const activeDay = slots.find((day) => day.label === dayLabel) ?? slots[0]
-  const mine = requests.filter((request) => request.resident === "Maria Silva")
-
-  const submit = () => {
-    if (!activeDay || !time) return
-    onRequest(activeDay.label, time, note.trim())
-    setTime("")
-    setNote("")
-    setSent(true)
-  }
+  const mine = supabaseConfigured ? requests : requests.filter((request) => request.resident === "Maria Silva")
 
   return (
     <>
@@ -3519,60 +4166,6 @@ function FamilyVideo({
             rotina da Maria.
           </span>
         </p>
-        <section className="section-block">
-          <div className="section-title"><div><h2>Escolha um horário</h2><span>Horários livres definidos pela casa</span></div></div>
-          {slots.length === 0 ? (
-            <p className="video-empty">
-              A casa ainda não tem horários livres de videochamada. Use o botão “Falar com a equipe”
-              no chat.
-            </p>
-          ) : (
-            <>
-              <div className="chip-row" role="group" aria-label="Dia">
-                {slots.map((day) => (
-                  <button
-                    aria-pressed={activeDay?.label === day.label}
-                    key={day.label}
-                    onClick={() => { setDayLabel(day.label); setTime(""); setSent(false) }}
-                    type="button"
-                  >
-                    {day.label}
-                  </button>
-                ))}
-              </div>
-              <div className="chip-row chip-row--times" role="group" aria-label="Horário">
-                {activeDay?.times.map((slot) => (
-                  <button
-                    aria-pressed={time === slot}
-                    key={slot}
-                    onClick={() => { setTime(slot); setSent(false) }}
-                    type="button"
-                  >
-                    {slot}
-                  </button>
-                ))}
-              </div>
-              <label className="video-note">
-                Recado para a equipe (opcional)
-                <input
-                  onChange={(event) => setNote(event.target.value)}
-                  placeholder="Ex.: queremos mostrar uma foto da família"
-                  value={note}
-                />
-              </label>
-              <button className="primary-button" disabled={!time} onClick={submit} type="button">
-                <Icon name="video" />
-                Solicitar videochamada
-              </button>
-              {sent && (
-                <p className="inline-toast" role="status">
-                  <Icon name="check" size={18} /> Pedido enviado. A equipe vai responder em breve.
-                </p>
-              )}
-            </>
-          )}
-        </section>
-
         <section className="section-block">
           <div className="section-title"><div><h2>Meus pedidos</h2><span>Acompanhe o status</span></div></div>
           {mine.length === 0 ? (
@@ -3621,6 +4214,101 @@ function FamilyVideo({
             </div>
           )}
         </section>
+        <button className="primary-button" onClick={onNewRequest} type="button">
+          <Icon name="video" />
+          Solicitar uma videochamada
+        </button>
+      </main>
+    </>
+  )
+}
+
+function FamilyVideoRequest({
+  config,
+  requests,
+  onRequest,
+  onBack,
+}: {
+  config: VideoConfig
+  requests: VideoRequest[]
+  onRequest: (dayLabel: string, time: string, note: string) => void | Promise<boolean>
+  onBack: () => void
+}) {
+  const [sendError, setSendError] = useState("")
+  const [sending, setSending] = useState(false)
+  const slots = generateSlots(config, requests)
+  const [dayLabel, setDayLabel] = useState("")
+  const [time, setTime] = useState("")
+  const [note, setNote] = useState("")
+  const activeDay = slots.find((day) => day.label === dayLabel) ?? slots[0]
+
+  const submit = async () => {
+    if (!activeDay || !time || sending) return
+    setSending(true)
+    setSendError("")
+    const ok = await onRequest(activeDay.label, time, note.trim())
+    setSending(false)
+    if (ok === false) {
+      setSendError("Não foi possível enviar o pedido. Tente outro horário ou fale com a equipe.")
+      return
+    }
+    onBack()
+  }
+
+  return (
+    <>
+      <TopBar eyebrow="Recanto do Lar · Maria Silva" title="Solicitar videochamada" onBack={onBack} />
+      <main className="screen-content video-content">
+        <section className="section-block">
+          <div className="section-title"><div><h2>Escolha um horário</h2><span>Horários livres definidos pela casa</span></div></div>
+          {slots.length === 0 ? (
+            <p className="video-empty">
+              A casa ainda não tem horários livres de videochamada. Use o botão “Falar com a equipe”
+              no chat.
+            </p>
+          ) : (
+            <>
+              <div className="chip-row" role="group" aria-label="Dia">
+                {slots.map((day) => (
+                  <button
+                    aria-pressed={activeDay?.label === day.label}
+                    key={day.label}
+                    onClick={() => { setDayLabel(day.label); setTime("") }}
+                    type="button"
+                  >
+                    {day.label}
+                  </button>
+                ))}
+              </div>
+              <div className="chip-row chip-row--times" role="group" aria-label="Horário">
+                {activeDay?.times.map((slot) => (
+                  <button
+                    aria-pressed={time === slot}
+                    key={slot}
+                    onClick={() => { setTime(slot) }}
+                    type="button"
+                  >
+                    {slot}
+                  </button>
+                ))}
+              </div>
+              <label className="video-note">
+                Recado para a equipe (opcional)
+                <input
+                  onChange={(event) => setNote(event.target.value)}
+                  placeholder="Ex.: queremos mostrar uma foto da família"
+                  value={note}
+                />
+              </label>
+              {sendError && <p className="login-error" role="alert">{sendError}</p>}
+              <button className="primary-button" disabled={!time || sending} onClick={submit} type="button">
+                <Icon name="video" />
+                Solicitar videochamada
+              </button>
+            </>
+          )}
+        </section>
+
       </main>
     </>
   )
@@ -3634,10 +4322,10 @@ function TeamVideo({
 }: {
   config: VideoConfig
   requests: VideoRequest[]
-  onDecide: (id: number, patch: Partial<VideoRequest>) => void
+  onDecide: (id: VideoId, patch: Partial<VideoRequest>) => void
   onJoin: (request: VideoRequest) => void
 }) {
-  const [declining, setDeclining] = useState<number | null>(null)
+  const [declining, setDeclining] = useState<VideoId | null>(null)
   const [reason, setReason] = useState("Residente descansando")
   const [suggestion, setSuggestion] = useState("")
   const reasons = ["Residente descansando", "Atividade programada", "Sem cuidador disponível nesse horário", "Outro motivo"]
@@ -3914,13 +4602,77 @@ function CallOverlay({
 export default function App() {
   const [screen, setScreen] = useState<Screen>("login")
   const [role, setRole] = useState<Role>("family")
+  const [account, setAccount] = useState<Account | null>(null)
+  // Link do e-mail (redefinição de senha ou convite): a pessoa precisa criar a senha.
+  const [needsPassword, setNeedsPassword] = useState(
+    () => supabaseConfigured && /type=(recovery|invite)/.test(window.location.hash),
+  )
+  const [loginNotice, setLoginNotice] = useState("")
+  const needsPasswordRef = useRef(needsPassword)
+  needsPasswordRef.current = needsPassword
   const [consentAccepted, setConsentAccepted] = useState(false)
   const [textSize, setTextSize] = useState<TextSize>("normal")
   const [themePreference, setThemePreference] = useState<ThemePreference>(readThemePreference)
   const [alertMinutes, setAlertMinutes] = useState<10 | 15 | 30>(15)
-  const [unansweredQuestions, setUnansweredQuestions] = useState<string[]>([
+  const [unansweredQuestions, setUnansweredQuestions] = useState<string[]>(supabaseConfigured ? [] : [
     "A Maria pode receber uma visita pela manhã?",
+    "Posso levar meu sobrinho no horário de visita da Maria?",
   ])
+  const [customAnswers, setCustomAnswers] = useState<Record<string, string>>({})
+  // Dados reais (só quando o Supabase está configurado).
+  const [realResidents, setRealResidents] = useState<RealResident[]>([])
+  const [realDoses, setRealDoses] = useState<Dose[]>([])
+  const [pendingMedicines, setPendingMedicines] = useState(0)
+  const [overdueThreads, setOverdueThreads] = useState<{ resident: string; minutes: number }[]>([])
+  const reloadMessages = async (list: RealResident[] = realResidents) => {
+    if (!supabaseConfigured || !account) return
+    const threads = await loadThreads()
+    const next: Record<string, ResidentMessage[]> = {}
+    const unread: Record<string, boolean> = {}
+    const late: { resident: string; minutes: number }[] = []
+    for (const [name, msgs] of Object.entries(threads)) {
+      next[name] = msgs.map((m) => ({ sender: m.sender, text: m.text }))
+      const last = msgs[msgs.length - 1]
+      unread[name] = last?.sender === "family" && (role !== "team" || msgs.length > (seen.msgs[name] ?? 0))
+      const minutes = last ? Math.floor((Date.now() - new Date(last.at).getTime()) / 60000) : 0
+      if (last?.sender === "family" && minutes >= alertMinutes) late.push({ resident: name, minutes })
+    }
+    for (const resident of list) next[resident.name] ??= []
+    setConversations(next)
+    setUnreadConversations((current) => ({ ...unread, ...Object.fromEntries(Object.keys(current).filter((k) => current[k] && unread[k] === undefined).map((k) => [k, false])) }))
+    setOverdueThreads(late)
+  }
+  const reloadVideo = async () => {
+    if (!supabaseConfigured || !account) return
+    const [config, requests, taken] = await Promise.all([loadVideoConfig(), loadVideoRequests(), loadTakenSlots()])
+    if (config) setVideoConfig(config)
+    setVideoRequests(requests)
+    setTakenSlots(taken)
+  }
+  const reloadMedication = async () => {
+    if (!supabaseConfigured || !account) return
+    void reloadVideo()
+    const [answers, minutes] = await Promise.all([loadHouseAnswers(), loadAlertMinutes()])
+    setCustomAnswers(answers)
+    if (minutes) setAlertMinutes(minutes)
+    if (role === "admin") {
+      const [pending, questions, residentsList] = await Promise.all([loadPendingCount(), loadHouseQuestions(), loadResidents()])
+      setPendingMedicines(pending)
+      setUnansweredQuestions(questions)
+      setRealResidents(residentsList)
+      await reloadMessages(residentsList)
+      return
+    }
+    const [list, doseList] = await Promise.all([loadResidents(), loadTodayDoses()])
+    setRealResidents(list)
+    setRealDoses(doseList)
+    await reloadMessages(list)
+  }
+  useEffect(() => {
+    if (screen === "login" || screen === "consent") return
+    void reloadMedication()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [account, role, screen])
   const [houseInfo, setHouseInfo] = useState<HouseInfo>({
     visitingHours: "todos os dias, das 14:00 às 17:00",
     phone: "(11) 4000-1234",
@@ -3953,7 +4705,7 @@ export default function App() {
     "Ana Lourdes": [],
     "Roberto Santos": [],
   })
-  const [conversations, setConversations] = useState<Record<string, ResidentMessage[]>>({
+  const [conversations, setConversations] = useState<Record<string, ResidentMessage[]>>(supabaseConfigured ? {} : {
     "Maria Silva": [
       {
         sender: "team",
@@ -3969,7 +4721,7 @@ export default function App() {
     "Ana Lourdes": [],
     "Roberto Santos": [],
   })
-  const [unreadConversations, setUnreadConversations] = useState<Record<string, boolean>>({
+  const [unreadConversations, setUnreadConversations] = useState<Record<string, boolean>>(supabaseConfigured ? {} : {
     "Maria Silva": false,
     "João Pereira": true,
     "Ana Lourdes": false,
@@ -3998,23 +4750,39 @@ export default function App() {
     duration: 20,
     blocked: [],
   })
-  const [videoRequests, setVideoRequests] = useState<VideoRequest[]>([
+  const [takenSlots, setTakenSlots] = useState<{ dayLabel: string; time: string }[]>([])
+  const [videoRequests, setVideoRequests] = useState<VideoRequest[]>(supabaseConfigured ? [] : [
     { id: 1, resident: "Maria Silva", requester: "Carla Souza", dayLabel: "seg 15", time: "15:20", status: "Confirmada" },
     { id: 2, resident: "João Pereira", requester: "Paulo Pereira", dayLabel: "qua 17", time: "15:40", status: "Solicitada" },
   ])
   const [activeCall, setActiveCall] = useState<VideoRequest | null>(null)
   const closeCall = useBackDismiss(activeCall !== null, () => setActiveCall(null), "call")
 
-  const requestVideo = (dayLabel: string, time: string, note: string) =>
+  const requestVideo = (dayLabel: string, time: string, note: string): void | Promise<boolean> => {
+    if (supabaseConfigured) {
+      const resident = realResidents[0]
+      if (!resident) return Promise.resolve(false)
+      return createVideoRequest(resident.id, dayLabel, time, note).then(async (ok) => {
+        await reloadVideo()
+        return ok
+      })
+    }
     setVideoRequests((current) => [
       ...current,
       { id: Date.now(), resident: "Maria Silva", requester: "Carla Souza", dayLabel, time, status: "Solicitada", note: note || undefined },
     ])
-  const updateVideo = (id: number, patch: Partial<VideoRequest>) =>
+  }
+  const updateVideo = (id: VideoId, patch: Partial<VideoRequest>) => {
     setVideoRequests((current) => current.map((request) => (request.id === id ? { ...request, ...patch } : request)))
+    if (supabaseConfigured) void updateVideoRequest(String(id), patch).then(() => reloadVideo())
+  }
   const publishPhoto = (photo: Omit<Photo, "id" | "author" | "time" | "day">) =>
     setPhotos((current) => [{ ...photo, id: Date.now(), author: "Elisa Pereira", time: nowTime(), day: 12 }, ...current])
-  const videoSlots = generateSlots(videoConfig, videoRequests)
+  const slotRequests: VideoRequest[] = [
+    ...videoRequests,
+    ...takenSlots.map((slot, index) => ({ id: `taken-${index}`, resident: "", requester: "", ...slot, status: "Solicitada" as VideoStatus })),
+  ]
+  const videoSlots = generateSlots(videoConfig, slotRequests)
     .slice(0, 3)
     .flatMap((day) => day.times.slice(0, 2).map((slot) => `${day.label} às ${slot}`))
     .slice(0, 4)
@@ -4038,6 +4806,27 @@ export default function App() {
     media.addEventListener("change", applyTheme)
     return () => media.removeEventListener("change", applyTheme)
   }, [themePreference])
+
+  useEffect(() => {
+    if (!supabaseConfigured) return
+    let active = true
+    restoreSession().then((user) => {
+      if (!active || !user || needsPasswordRef.current) return
+      setRole(user.role)
+      setAccount({ name: user.name, email: user.email })
+      setScreen(user.role === "admin" ? "admin-dashboard" : user.role === "team" ? "team" : "consent")
+    })
+    const stop = onSignedOut(() => {
+      setAccount(null)
+      setScreen("login")
+    })
+    const stopRecovery = onPasswordRecovery(() => setNeedsPassword(true))
+    return () => {
+      active = false
+      stop()
+      stopRecovery()
+    }
+  }, [])
 
   useEffect(() => {
     window.history.replaceState({ screen: "login" }, "", window.location.href)
@@ -4065,13 +4854,77 @@ export default function App() {
       ...current,
       [residentName]: [...(current[residentName] ?? []), { sender, text: message }],
     }))
-    if (sender === "family") {
-      setUnreadConversations((current) => ({
-        ...current,
-        [residentName]: true,
-      }))
+    // Mensagem da família deixa a conversa "não lida"; resposta da equipe ou da administração limpa.
+    setUnreadConversations((current) => ({
+      ...current,
+      [residentName]: sender === "family",
+    }))
+    if (supabaseConfigured) {
+      const resident = realResidents.find((item) => item.name === residentName)
+      if (resident) void sendMessage(resident.id, message, sender).then(() => reloadMessages())
     }
   }
+  const familyResident = supabaseConfigured ? (realResidents[0]?.name ?? "") : "Maria Silva"
+
+  // Avisos: o que a pessoa já viu fica guardado neste aparelho.
+  const seenKey = `recanto-visto-${account?.email ?? "demo"}`
+  const [seen, setSeen] = useState<{ msgs: Record<string, number>; video: string[] }>({
+    msgs: supabaseConfigured ? {} : { "Maria Silva": 1 },
+    video: [],
+  })
+  useEffect(() => {
+    try {
+      const raw = window.localStorage.getItem(seenKey)
+      if (raw) setSeen(JSON.parse(raw))
+    } catch {
+      // Sem armazenamento: os avisos valem só nesta sessão.
+    }
+  }, [seenKey])
+  const saveSeen = (next: { msgs: Record<string, number>; video: string[] }) => {
+    setSeen(next)
+    try {
+      window.localStorage.setItem(seenKey, JSON.stringify(next))
+    } catch {
+      // ignorado
+    }
+  }
+  const familyThread = conversations[familyResident] ?? []
+  const familyReplyUnread =
+    role === "family" && familyThread.length > (seen.msgs[familyResident] ?? 0) && familyThread[familyThread.length - 1]?.sender !== "family"
+  const videoAnswers = videoRequests.filter((request) => request.status !== "Solicitada" && request.status !== "Realizada")
+  const videoAnswerKeys = videoAnswers.map((request) => `${request.id}:${request.status}`)
+  const unseenVideo = role === "family" ? videoAnswerKeys.filter((key) => !seen.video.includes(key)).length : 0
+  useEffect(() => {
+    if (role !== "family") return
+    if (screen === "caregiver" && familyThread.length !== (seen.msgs[familyResident] ?? 0)) {
+      saveSeen({ ...seen, msgs: { ...seen.msgs, [familyResident]: familyThread.length } })
+    }
+    if (screen === "family-video" && unseenVideo > 0) {
+      saveSeen({ ...seen, video: Array.from(new Set([...seen.video, ...videoAnswerKeys])) })
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [screen, familyThread.length, unseenVideo])
+  const navBadges: Partial<Record<Screen, number>> =
+    role === "family"
+      ? { chat: familyReplyUnread ? 1 : 0, summary: unseenVideo }
+      : role === "team"
+        ? {
+            team: Object.values(unreadConversations).filter(Boolean).length,
+            "team-video": videoRequests.filter((request) => request.status === "Solicitada").length,
+          }
+        : { "admin-dashboard": unansweredQuestions.length + (supabaseConfigured ? overdueThreads.length : 0) }
+
+  // Atualização automática: novas mensagens e pedidos aparecem sem recarregar a página.
+  const refreshRef = useRef<() => void>(() => {})
+  refreshRef.current = () => {
+    void reloadMessages()
+    void reloadVideo()
+  }
+  useEffect(() => {
+    if (!supabaseConfigured || !account) return
+    const timer = window.setInterval(() => refreshRef.current(), 15000)
+    return () => window.clearInterval(timer)
+  }, [account])
 
   const addActivity = (residentName: string, name: string, time: string) => {
     setActivitiesByResident((current) => ({
@@ -4109,10 +4962,23 @@ export default function App() {
   return (
     <div className="app-shell">
       <div className={`phone phone--text-${textSize}`}>
-        {screen === "login" ? (
+        {needsPassword ? (
+          <SetPassword
+            onDone={async () => {
+              await signOut()
+              window.history.replaceState({ screen: "login" }, "", window.location.pathname)
+              setNeedsPassword(false)
+              setAccount(null)
+              setLoginNotice("Senha criada. Entre com a sua nova senha.")
+              setScreen("login")
+            }}
+          />
+        ) : screen === "login" ? (
           <Login
-            onEnter={(selectedRole) => {
+            notice={loginNotice}
+            onEnter={(selectedRole, signedAccount) => {
               setRole(selectedRole)
+              setAccount(signedAccount ?? null)
               navigate(
                 selectedRole === "admin"
                   ? "admin-dashboard"
@@ -4136,20 +5002,31 @@ export default function App() {
           <div className="app-view">
             {screen === "chat" && (
               <Chat
+                doses={supabaseConfigured ? realDoses : null}
                 activities={activitiesByResident["Maria Silva"]}
+                customAnswers={customAnswers}
                 houseInfo={houseInfo}
                 onOpenVideo={() => navigate("family-video")}
                 videoSlots={videoSlots}
                 onTalkToCaregiver={() => navigate("caregiver")}
-                onUnansweredQuestion={(question) =>
+                askAi={
+                  supabaseConfigured && realResidents[0]
+                    ? (question: string) => askAssistantAi(question, realResidents[0].id)
+                    : undefined
+                }
+                teamReplyUnread={familyReplyUnread}
+                onUnansweredQuestion={(question) => {
+                  sendResidentMessage(familyResident, `Pergunta feita à assistente: ${question}`, "family")
+                  if (supabaseConfigured) void addHouseQuestion(question)
                   setUnansweredQuestions((current) =>
                     current.includes(question) ? current : [...current, question],
                   )
-                }
+                }}
               />
             )}
             {screen === "summary" && (
               <Summary
+                doses={supabaseConfigured ? realDoses : null}
                 activities={activitiesByResident["Maria Silva"]}
                 houseInfo={houseInfo}
                 onOpenVideo={() => navigate("family-video")}
@@ -4159,12 +5036,23 @@ export default function App() {
             )}
             {screen === "family-video" && (
               <FamilyVideo
-                config={videoConfig}
                 onBack={() => window.history.back()}
-                onCancel={(id) => setVideoRequests((current) => current.filter((request) => request.id !== id))}
+                onCancel={(id) => {
+                  setVideoRequests((current) => current.filter((request) => request.id !== id))
+                  if (supabaseConfigured) void updateVideoRequest(String(id), { status: "Cancelada" }).then(() => reloadVideo())
+                }}
                 onJoin={setActiveCall}
+                onNewRequest={() => navigate("family-video-request")}
                 onRequest={requestVideo}
                 requests={videoRequests}
+              />
+            )}
+            {screen === "family-video-request" && (
+              <FamilyVideoRequest
+                config={videoConfig}
+                onBack={() => window.history.back()}
+                onRequest={requestVideo}
+                requests={slotRequests}
               />
             )}
             {screen === "team-photos" && (
@@ -4186,31 +5074,52 @@ export default function App() {
             )}
             {screen === "caregiver" && (
               <Caregiver
-                messages={conversations["Maria Silva"]}
+                messages={conversations[familyResident] ?? []}
                 onBack={() => window.history.back()}
-                onSendMessage={(message) => sendResidentMessage("Maria Silva", message, "family")}
+                onSendMessage={(message) => sendResidentMessage(familyResident, message, "family")}
               />
             )}
             {screen === "team" && (
               <TeamPanel
+                doses={realDoses}
+                onAddPrescription={async (residentId, medicine, dose, time) => {
+                  const ok = await addPrescription(residentId, medicine, dose, time)
+                  if (ok) await reloadMedication()
+                  return ok
+                }}
+                onMarkDose={async (doseId) => {
+                  const ok = await markDoseGiven(doseId)
+                  if (ok) await reloadMedication()
+                  return ok
+                }}
+                realResidents={realResidents}
                 activitiesByResident={activitiesByResident}
                 conversations={conversations}
                 onAddActivity={addActivity}
                 unreadConversations={unreadConversations}
-                onMarkAsRead={(residentName) =>
+                onMarkAsRead={(residentName) => {
                   setUnreadConversations((current) => ({
                     ...current,
                     [residentName]: false,
                   }))
-                }
+                  saveSeen({ ...seen, msgs: { ...seen.msgs, [residentName]: (conversations[residentName] ?? []).length } })
+                }}
                 onSendMessage={sendResidentMessage}
                 onUpdateActivity={updateActivity}
               />
             )}
             {screen === "admin-dashboard" && (
               <AdminDashboard
+                pendingMedicines={supabaseConfigured ? pendingMedicines : undefined}
                 alertMinutes={alertMinutes}
-                onOpenHouse={() => navigate("admin-house")}
+                conversations={conversations}
+                overdueThreads={supabaseConfigured ? overdueThreads : undefined}
+                onAnswerQuestion={(question, answer) => {
+                  if (supabaseConfigured) void answerHouseQuestion(question, answer)
+                  setCustomAnswers((current) => ({ ...current, [question]: answer }))
+                  setUnansweredQuestions((current) => current.filter((item) => item !== question))
+                }}
+                onReply={(resident, text) => sendResidentMessage(resident, text, "admin")}
                 pendingVideo={videoRequests.filter((request) => request.status === "Solicitada").length}
                 unansweredQuestions={unansweredQuestions}
                 unreadConversations={unreadConversations}
@@ -4259,16 +5168,27 @@ export default function App() {
               <AdminHouse
                 alertMinutes={alertMinutes}
                 houseInfo={houseInfo}
-                onAlertMinutesChange={setAlertMinutes}
+                onAlertMinutesChange={(minutes) => {
+                  setAlertMinutes(minutes)
+                  if (supabaseConfigured) void saveAlertMinutes(minutes)
+                }}
                 onHouseInfoChange={setHouseInfo}
-                onVideoConfigChange={setVideoConfig}
+                onVideoConfigChange={(config) => {
+                  setVideoConfig(config)
+                  if (supabaseConfigured) void saveVideoConfig(config)
+                }}
                 videoConfig={videoConfig}
                 videoRequests={videoRequests}
               />
             )}
             {screen === "profile" && (
               <Profile
-                onExit={() => navigate("login")}
+                account={account}
+                onExit={async () => {
+                  await signOut()
+                  setAccount(null)
+                  navigate("login")
+                }}
                 onTextSizeChange={setTextSize}
                 onThemeChange={setThemePreference}
                 role={role}
@@ -4276,7 +5196,7 @@ export default function App() {
                 themePreference={themePreference}
               />
             )}
-            <BottomNav active={screen === "family-video" ? "summary" : screen} onChange={navigate} role={role} />
+            <BottomNav active={screen === "family-video" || screen === "family-video-request" ? "summary" : screen} badges={navBadges} onChange={navigate} role={role} />
             {activeCall && (
               <CallOverlay
                 onClose={closeCall}

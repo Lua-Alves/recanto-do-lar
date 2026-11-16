@@ -31,13 +31,8 @@ insert into public.prescriptions (resident_id, medicine, dose, times) values
   ('11111111-1111-1111-1111-111111111111', 'Vitamina D', '1 cápsula', '{09:00}'),
   ('11111111-1111-1111-1111-111111111111', 'Metformina', '500 mg',    '{12:00}');
 
--- Doses de hoje: manhã já administradas, 20:00 aguardando.
-insert into public.medication_administrations
-  (prescription_id, resident_id, scheduled_for, status, administered_at, administered_by)
-select p.id, p.resident_id, (current_date + t)::timestamptz,
-       case when t < time '20:00' then 'administrado' else 'aguardando' end,
-       case when t < time '20:00' then (current_date + t)::timestamptz + interval '5 minutes' end,
-       case when t < time '20:00' then (select id from public.profiles where email = 'cuidador@teste.com') end
-  from public.prescriptions p, unnest(p.times) as t
- where p.resident_id = '11111111-1111-1111-1111-111111111111'
-on conflict do nothing;
+-- Doses de hoje (fuso de São Paulo): manhã já administradas, 20:00 aguardando.
+select public.ensure_doses_today();
+update public.medication_administrations
+   set status = 'administrado'
+ where (scheduled_for at time zone 'America/Sao_Paulo')::time < time '20:00';

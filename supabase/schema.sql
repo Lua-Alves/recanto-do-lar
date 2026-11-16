@@ -419,3 +419,205 @@ values ('(00) 0000-0000', 'todos os dias, das 14h às 17h',
         'Avise a equipe ao chegar.')
 on conflict do nothing;
 insert into public.video_config default values on conflict do nothing;
+
+-- ---------- 9. Mensagens e respostas da casa ----------------------
+alter table public.house_info
+  add column if not exists alert_minutes int not null default 15
+  check (alert_minutes in (10, 15, 30));
+
+-- Conversa de cada residente entre família, equipe e administração.
+create table if not exists public.messages (
+  id           uuid primary key default gen_random_uuid(),
+  resident_id  uuid not null references public.residents (id) on delete cascade,
+  sender_id    uuid not null references public.profiles (id),
+  sender_role  text not null check (sender_role in ('familiar', 'cuidador', 'admin')),
+  body         text not null check (char_length(body) between 1 and 2000),
+  created_at   timestamptz not null default now()
+);
+create index if not exists messages_resident_idx on public.messages (resident_id, created_at);
+
+-- Respostas que a administração cadastra para perguntas que a assistente não soube responder.
+create table if not exists public.house_answers (
+  id           uuid primary key default gen_random_uuid(),
+  question     text not null,
+  answer       text not null,
+  answered_by  uuid references public.profiles (id),
+  created_at   timestamptz not null default now()
+);
+
+-- A última mensagem é da família e já passou do tempo configurado?
+create or replace function public.thread_overdue(rid uuid)
+returns boolean language sql stable security definer set search_path = public as $$
+  select coalesce((
+    select m.sender_role = 'familiar'
+       and m.created_at < now() - make_interval(mins => (select alert_minutes from public.house_info limit 1))
+      from public.messages m
+     where m.resident_id = rid
+     order by m.created_at desc
+     limit 1
+  ), false)
+$$;
+
+alter table public.messages      enable row level security;
+alter table public.house_answers enable row level security;
+
+drop policy if exists msg_family_read   on public.messages;
+drop policy if exists msg_family_ins    on public.messages;
+drop policy if exists msg_staff_read    on public.messages;
+drop policy if exists msg_staff_ins     on public.messages;
+drop policy if exists msg_admin_read    on public.messages;
+drop policy if exists msg_admin_ins     on public.messages;
+drop policy if exists answers_read      on public.house_answers;
+drop policy if exists answers_admin     on public.house_answers;
+
+-- Família: lê e escreve só na conversa do seu residente.
+create policy msg_family_read on public.messages for select
+  using (public.is_family_of(resident_id));
+create policy msg_family_ins on public.messages for insert
+  with check (public.is_family_of(resident_id) and sender_id = auth.uid() and sender_role = 'familiar');
+
+-- Equipe: lê tudo e responde em seu nome.
+create policy msg_staff_read on public.messages for select
+  using (public.is_caregiver());
+create policy msg_staff_ins on public.messages for insert
+  with check (public.is_caregiver() and sender_id = auth.uid() and sender_role = 'cuidador');
+
+-- Administração: só acessa a conversa quando a família ficou sem resposta
+-- acima do tempo configurado (e sempre vê o que ela mesma enviou).
+create policy msg_admin_read on public.messages for select
+  using (public.is_admin() and (sender_id = auth.uid() or public.thread_overdue(resident_id)));
+create policy msg_admin_ins on public.messages for insert
+  with check (public.is_admin() and sender_id = auth.uid() and sender_role = 'admin'
+              and public.thread_overdue(resident_id));
+
+-- Respostas da casa: todos os acessos leem (a assistente usa); só admin escreve.
+create policy answers_read  on public.house_answers for select using (auth.uid() is not null);
+create policy answers_admin on public.house_answers for all
+  using (public.is_admin()) with check (public.is_admin());
+
+-- ---------- 10. Medicação: doses do dia e regras ---------------------
+-- Nome de quem administrou, guardado na própria dose (a família lê sem acessar perfis).
+alter table public.medication_administrations
+  add column if not exists administered_by_name text;
+
+-- Ao marcar "administrado", o banco preenche horário, responsável e nome.
+-- O app não consegue informar outra pessoa nem outro horário.
+create or replace function public.stamp_administration()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if new.status = 'administrado' and (tg_op = 'INSERT' or old.status is distinct from 'administrado') then
+    new.administered_at := now();
+    new.administered_by := auth.uid();
+    new.administered_by_name := (select full_name from public.profiles where id = auth.uid());
+  elsif new.status <> 'administrado' then
+    new.administered_at := null;
+    new.administered_by := null;
+    new.administered_by_name := null;
+  end if;
+  return new;
+end $$;
+
+drop trigger if exists stamp_administration_trg on public.medication_administrations;
+create trigger stamp_administration_trg
+  before insert or update on public.medication_administrations
+  for each row execute function public.stamp_administration();
+
+-- Gera as doses de hoje (fuso de São Paulo) a partir das prescrições ativas.
+create or replace function public.ensure_doses_today()
+returns void language plpgsql security definer set search_path = public as $$
+declare d date := (now() at time zone 'America/Sao_Paulo')::date;
+begin
+  insert into public.medication_administrations (prescription_id, resident_id, scheduled_for)
+  select p.id, p.resident_id, ((d + t) at time zone 'America/Sao_Paulo')
+    from public.prescriptions p, unnest(p.times) as t
+   where p.active and p.start_date <= d and (p.end_date is null or p.end_date >= d)
+  on conflict (prescription_id, scheduled_for) do nothing;
+end $$;
+revoke all on function public.ensure_doses_today() from public, anon;
+grant execute on function public.ensure_doses_today() to authenticated;
+
+-- Prescrição: a EQUIPE cadastra e altera; família lê as do seu residente.
+-- A administração não acessa prescrições (só enxerga a visão sem nome do residente).
+drop policy if exists rx_read  on public.prescriptions;
+drop policy if exists rx_admin on public.prescriptions;
+drop policy if exists rx_staff_read  on public.prescriptions;
+drop policy if exists rx_staff_write on public.prescriptions;
+create policy rx_read on public.prescriptions for select
+  using (public.is_caregiver() or public.is_family_of(resident_id));
+create policy rx_staff_write on public.prescriptions for all
+  using (public.is_caregiver()) with check (public.is_caregiver());
+
+-- Visão para a administração: doses de hoje que aguardam, SEM nome do residente.
+create or replace view public.pending_medications as
+  select a.id, p.medicine, p.dose, a.scheduled_for
+    from public.medication_administrations a
+    join public.prescriptions p on p.id = a.prescription_id
+   where a.status = 'aguardando'
+     and (a.scheduled_for at time zone 'America/Sao_Paulo')::date
+         = (now() at time zone 'America/Sao_Paulo')::date
+     and (public.is_admin() or public.is_caregiver());
+revoke all on public.pending_medications from anon;
+grant select on public.pending_medications to authenticated;
+
+-- ---------- 11. Perguntas sem resposta da assistente -------------
+create table if not exists public.house_questions (
+  id          uuid primary key default gen_random_uuid(),
+  question    text not null check (char_length(question) between 1 and 500),
+  asked_by    uuid not null references public.profiles (id),
+  created_at  timestamptz not null default now(),
+  unique (question)
+);
+alter table public.house_questions enable row level security;
+
+drop policy if exists hq_ins   on public.house_questions;
+drop policy if exists hq_admin on public.house_questions;
+-- Qualquer pessoa logada registra a pergunta (sem poder lê-la depois);
+-- só a administração lê e apaga.
+create policy hq_ins on public.house_questions for insert
+  with check (asked_by = auth.uid());
+create policy hq_admin on public.house_questions for all
+  using (public.is_admin()) with check (public.is_admin());
+
+-- ---------- 12. Videochamada -------------------------------------
+alter table public.video_config
+  add column if not exists blocked_dates date[] not null default '{}';
+
+alter table public.video_requests
+  add column if not exists note text,
+  add column if not exists reason text,
+  add column if not exists suggestion text,
+  add column if not exists requester_name text;
+
+-- Guarda o nome de quem pediu (a equipe e a administração leem sem acessar perfis).
+create or replace function public.stamp_video_request()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if tg_op = 'INSERT' then
+    new.requester_name := (select full_name from public.profiles where id = auth.uid());
+    new.status := 'solicitada';
+  end if;
+  return new;
+end $$;
+drop trigger if exists stamp_video_request_trg on public.video_requests;
+create trigger stamp_video_request_trg
+  before insert on public.video_requests
+  for each row execute function public.stamp_video_request();
+
+-- Família pode cancelar o próprio pedido que ainda não foi respondido.
+drop policy if exists vreq_family_cancel on public.video_requests;
+create policy vreq_family_cancel on public.video_requests for update
+  using (requested_by = auth.uid() and status = 'solicitada')
+  with check (requested_by = auth.uid() and status = 'cancelada');
+
+-- Horários já ocupados (sem revelar quem pediu): evita dois pedidos no mesmo horário.
+create or replace function public.video_taken_slots()
+returns setof timestamptz language sql stable security definer set search_path = public as $$
+  select slot_start from public.video_requests
+   where status in ('solicitada', 'confirmada') and slot_start > now()
+$$;
+revoke all on function public.video_taken_slots() from public, anon;
+grant execute on function public.video_taken_slots() to authenticated;
+
+alter table public.video_requests drop constraint if exists video_requests_resident_id_slot_start_key;
+create unique index if not exists video_requests_active_slot
+  on public.video_requests (slot_start) where status in ('solicitada', 'confirmada');
