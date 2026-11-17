@@ -376,6 +376,7 @@ export async function askAssistantAi(question: string, residentId: string): Prom
   // Segurança: se a IA mandar markdown, tiramos asteriscos e títulos.
   const clean = raw
     .replace("[ENCAMINHAR]", "")
+    .replace(/\s*Falar com a equipe\.?/gi, "")
     .replace(/\*\*(.+?)\*\*/g, "$1")
     .replace(/^\s*\*\s+/gm, "- ")
     .replace(/^#+\s*/gm, "")

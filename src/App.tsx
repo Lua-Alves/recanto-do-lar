@@ -956,6 +956,7 @@ function AssistantAnswer({
   onOpenVideo,
   customText,
   doses,
+  hideSource,
 }: {
   activities: Activity[]
   houseInfo: HouseInfo
@@ -964,6 +965,7 @@ function AssistantAnswer({
   onOpenVideo: () => void
   customText?: string
   doses?: Dose[] | null
+  hideSource?: boolean
 }) {
   return (
     <div className="message message--assistant">
@@ -1078,9 +1080,11 @@ function AssistantAnswer({
           Não tenho essa informação. Já enviei sua pergunta para a equipe, que vai responder no chat com a equipe. Você será avisado aqui.
         </p>
       )}
-      <span className="assistant-source">
-        Informação cadastrada pela equipe · atualizada hoje às 14:30
-      </span>
+      {!hideSource && topic !== "clinical" && topic !== "unknown" && (
+        <span className="assistant-source">
+          Informação cadastrada pela equipe · atualizada hoje às 14:30
+        </span>
+      )}
       <ResponseFeedback />
     </div>
   )
@@ -1112,7 +1116,7 @@ function Chat({
   const [message, setMessage] = useState("")
   const [screenState, setScreenState] = useState<ContentState>("ready")
   const [sentMessages, setSentMessages] = useState<
-    { question: string; topic: AssistantTopic; typing: boolean; time: string; custom?: string }[]
+    { question: string; topic: AssistantTopic; typing: boolean; time: string; custom?: string; ai?: boolean }[]
   >([])
 
   const getTopic = (question: string): AssistantTopic => {
@@ -1148,6 +1152,7 @@ function Chat({
         question: question.trim(),
         topic: "custom" as AssistantTopic,
         custom: "",
+        ai: true,
         typing: true,
         time: new Date().toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" }),
       }
@@ -1280,6 +1285,7 @@ function Chat({
                         houseInfo={houseInfo}
                         onOpenVideo={onOpenVideo}
                         customText={sent.custom}
+                        hideSource={sent.ai}
                         topic={sent.topic}
                         videoSlots={videoSlots}
                       />
