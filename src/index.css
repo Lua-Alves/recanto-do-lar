@@ -4305,11 +4305,26 @@ input[type="radio"] {
 }
 .summary-metrics div {
   min-width: 0;
-  overflow-wrap: anywhere;
+}
+.summary-metrics--four {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.summary-metrics--four div:nth-child(odd) {
+  border-left: 0;
+}
+.summary-metrics--four div:nth-child(even) {
+  border-left: 1px solid var(--line);
+}
+.summary-metrics--four div:nth-child(n + 3) {
+  border-top: 1px solid var(--line);
+}
+.resident-info > span {
+  display: block;
 }
 .resident-info small {
-  display: inline-flex;
+  display: flex;
   flex-wrap: wrap;
+  margin-left: 0;
   max-width: 100%;
 }
 .nav-item {

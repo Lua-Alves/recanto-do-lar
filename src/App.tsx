@@ -1251,17 +1251,21 @@ function Chat({
           />
         ) : (
           <>
-            <div className="status-card">
-              <Avatar initials="MS" size="small" label="Maria Silva" />
-              <div>
-                <strong>Maria está bem hoje</strong>
-                <span>Atualizado pela equipe às 14:30</span>
+            {!supabaseConfigured && (
+              <div className="status-card">
+                <Avatar initials="MS" size="small" label="Maria Silva" />
+                <div>
+                  <strong>Maria está bem hoje</strong>
+                  <span>Atualizado pela equipe às 14:30</span>
+                </div>
+                <span className="online-dot" />
               </div>
-              <span className="online-dot" />
-            </div>
+            )}
 
             <div className="day-divider"><span>Hoje</span></div>
             <div className="messages">
+              {!supabaseConfigured && (
+                <>
               <div className="message message--user">
                 Qual remédio ela toma à noite?
                 <span>14:32</span>
@@ -1277,6 +1281,8 @@ function Chat({
                   videoSlots={videoSlots}
                 />
               </div>
+                </>
+              )}
               {sentMessages.map((sent, index) => (
                 <div className="message-exchange" key={`${sent.question}-${index}`}>
                   <div className="message message--user">
@@ -1424,7 +1430,7 @@ function Summary({
                 <div><span>Criado pela assistente</span><h2>Resumo da semana</h2></div>
               </div>
               <p>
-                Nos últimos 7 dias a Maria esteve <strong>bem na maior parte do tempo</strong>. No dia {dayInfo(7).num}
+                Nos últimos 7 dias a Maria esteve <strong>bem na maior parte do tempo</strong>. No dia {dayInfo(7).num}{" "}
                 ficou mais cansada e comeu um pouco menos, mas desde o dia {dayInfo(8).num} voltou ao normal.
               </p>
               <div className="summary-metrics summary-metrics--four">
@@ -2311,7 +2317,7 @@ function TeamPanel({
       <TopBar eyebrow="Recanto do Lar · Painel da equipe" title="Boa tarde, Elisa" avatar="EP" />
       <main className="screen-content team-content">
         <section className="shift-card">
-          <div><span>Plantão de hoje</span><strong>08:00 — 18:00</strong><small>4 residentes sob seus cuidados</small></div>
+          <div><span>Plantão de hoje</span><strong>08:00 — 18:00</strong><small>{residentList.length} {residentList.length === 1 ? "residente sob seus cuidados" : "residentes sob seus cuidados"}</small></div>
           <span className="shift-icon"><Icon name="team" /></span>
         </section>
         <div className="search-box">
