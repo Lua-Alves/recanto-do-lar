@@ -70,6 +70,18 @@ type ThemePreference = "light" | "dark" | "system"
 
 const THEME_STORAGE_KEY = "recanto-theme"
 
+const TEXT_SIZE_KEY = "recanto-text-size"
+
+function readTextSize(): TextSize {
+  try {
+    const stored = window.localStorage.getItem(TEXT_SIZE_KEY)
+    if (stored === "normal" || stored === "large" || stored === "xlarge") return stored
+  } catch {
+    // Armazenamento indisponível: usa o tamanho normal.
+  }
+  return "normal"
+}
+
 function readThemePreference(): ThemePreference {
   try {
     const stored = window.localStorage.getItem(THEME_STORAGE_KEY)
@@ -1387,14 +1399,14 @@ function Summary({
   const isToday = selectedDay === 12
   const past = PAST_DAYS.find((day) => day.n === selectedDay)
   const dayPhotos = photos.filter((photo) => photo.day === selectedDay && photo.residents.includes(residentName))
-  const weekdays = [...PAST_DAYS.map((day) => ({ n: day.n, wd: day.wd, mood: day.mood })), { n: 12, wd: "sex", mood: "Muito bem" }]
+  const weekdays = [...PAST_DAYS.map((day) => day.n), 12].map((n) => ({ n, ...dayInfo(n) }))
   const nextCall = videoRequests.find((request) => (supabaseConfigured || request.resident === "Maria Silva") && request.status === "Confirmada")
   const weekActivities = PAST_DAYS.reduce((sum, day) => sum + day.done, 0) + completedActivities.length
   const weekPlanned = PAST_DAYS.reduce((sum, day) => sum + day.total, 0) + activities.length
 
   return (
     <>
-      <TopBar eyebrow="Recanto do Lar · 12 de junho" title="Olá, Carla" />
+      <TopBar eyebrow={`Recanto do Lar · ${TODAY_LABEL}`} title="Olá, Carla" />
       <main className="screen-content summary-content">
         <EmergencyNotice phone={houseInfo.phone} />
         <StateSwitcher value={screenState} onChange={setScreenState} />
@@ -1412,8 +1424,8 @@ function Summary({
                 <div><span>Criado pela assistente</span><h2>Resumo da semana</h2></div>
               </div>
               <p>
-                Nos últimos 7 dias a Maria esteve <strong>bem na maior parte do tempo</strong>. No domingo
-                ficou mais cansada e comeu um pouco menos, mas desde segunda voltou ao normal.
+                Nos últimos 7 dias a Maria esteve <strong>bem na maior parte do tempo</strong>. No dia {dayInfo(7).num}
+                ficou mais cansada e comeu um pouco menos, mas desde o dia {dayInfo(8).num} voltou ao normal.
               </p>
               <div className="summary-metrics summary-metrics--four">
                 <div><span>Humor bom</span><strong>6/7</strong></div>
@@ -1440,13 +1452,13 @@ function Summary({
               {weekdays.map((day) => (
                 <button
                   aria-pressed={selectedDay === day.n}
-                  aria-label={`${day.wd} ${day.n}${day.n === 12 ? ", hoje" : ""}`}
+                  aria-label={`${day.wd} ${day.num}${day.n === 12 ? ", hoje" : ""}`}
                   key={day.n}
                   onClick={() => setSelectedDay(day.n)}
                   type="button"
                 >
                   <span>{day.n === 12 ? "hoje" : day.wd}</span>
-                  <strong>{day.n}</strong>
+                  <strong>{day.num}</strong>
                 </button>
               ))}
             </div>
@@ -1467,7 +1479,7 @@ function Summary({
             {dayTab === "resumo" && (
             <section className="section-block">
               <div className="section-title">
-                <div><h2>{isToday ? "Hoje" : `${past?.wd} ${selectedDay}`}</h2><span>Resumo do dia</span></div>
+                <div><h2>{isToday ? "Hoje" : `${dayInfo(selectedDay).wd} ${dayInfo(selectedDay).num}`}</h2><span>Resumo do dia</span></div>
               </div>
               {isToday ? (
                 <p className="day-text">
@@ -2676,7 +2688,7 @@ function AdminDashboard({
                 </button>
               </article>
             ))}
-            {overdue.length === 0 && supabaseConfigured && (
+            {overdue.length === 0 && supabaseConfigured && (pendingList ?? []).length === 0 && (
               <p className="video-empty">Nenhum alerta no momento.</p>
             )}
             {supabaseConfigured && (pendingList ?? []).map((item) => (
@@ -3690,7 +3702,7 @@ function AdminHouse({
               onHouseInfoChange({
                 ...draft,
                 updatedBy: "Marta Andrade",
-                updatedAt: "12 de junho às 09:15",
+                updatedAt: `${TODAY_LABEL} às 09:15`,
               })
               setSaved(true)
             }}
@@ -3700,7 +3712,7 @@ function AdminHouse({
             {saved ? "Salvo" : "Salvar informações"}
           </button>
           <small>
-            Última atualização por {saved ? "Marta Andrade, 12 de junho às 09:15" : `${houseInfo.updatedBy}, ${houseInfo.updatedAt}`}
+            Última atualização por {saved ? `Marta Andrade, ${TODAY_LABEL} às 09:15` : `${houseInfo.updatedBy}, ${houseInfo.updatedAt}`}
           </small>
           <p>
             Estas informações aparecem para as famílias, no aviso de emergência e nas
@@ -4058,14 +4070,14 @@ function Profile({
           </div>
         </dl>
         <section className="profile-card">
+          <button
+            onClick={() => setProfilePage("text")}
+            type="button"
+          >
+            <span><Icon name="profile" /> Tamanho do texto</span><Icon name="chevron" />
+          </button>
           {isFamily && (
             <>
-              <button
-                onClick={() => setProfilePage("text")}
-                type="button"
-              >
-                <span><Icon name="profile" /> Tamanho do texto</span><Icon name="chevron" />
-              </button>
               <button
                 onClick={() => setProfilePage("notifications")}
                 type="button"
@@ -4174,6 +4186,15 @@ const SAMPLE_PAINTING = svgUri(
 const SAMPLE_GARDEN = svgUri(
   "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 400 300'><rect width='400' height='300' fill='#cfeaf0'/><circle cx='320' cy='60' r='32' fill='#f59e0b'/><path d='M0 190 Q100 120 210 180 T400 160 V300 H0Z' fill='#6dbf7b'/><path d='M0 230 Q140 180 400 225 V300 H0Z' fill='#2f9a52'/><circle cx='90' cy='235' r='9' fill='#f2683c'/><circle cx='140' cy='255' r='9' fill='#dc2626'/><circle cx='250' cy='245' r='9' fill='#ffffff'/><circle cx='310' cy='262' r='9' fill='#f59e0b'/></svg>",
 )
+
+const WEEKDAYS_PT = ["dom", "seg", "ter", "qua", "qui", "sex", "sáb"]
+// Os dias internos vão de 6 a 12 (12 = hoje). Esta função devolve a data real de cada um.
+const dayInfo = (n: number) => {
+  const date = new Date()
+  date.setDate(date.getDate() - (12 - n))
+  return { num: date.getDate(), wd: WEEKDAYS_PT[date.getDay()] }
+}
+const TODAY_LABEL = new Date().toLocaleDateString("pt-BR", { day: "numeric", month: "long" })
 
 const PAST_DAYS: DayRecord[] = [
   {
@@ -4767,7 +4788,15 @@ export default function App() {
   const needsPasswordRef = useRef(needsPassword)
   needsPasswordRef.current = needsPassword
   const [consentAccepted, setConsentAccepted] = useState(false)
-  const [textSize, setTextSize] = useState<TextSize>("normal")
+  const [textSize, setTextSizeState] = useState<TextSize>(readTextSize)
+  const setTextSize = (size: TextSize) => {
+    setTextSizeState(size)
+    try {
+      window.localStorage.setItem(TEXT_SIZE_KEY, size)
+    } catch {
+      // Armazenamento indisponível: a escolha vale só até fechar o app.
+    }
+  }
   const [themePreference, setThemePreference] = useState<ThemePreference>(readThemePreference)
   const [alertMinutes, setAlertMinutes] = useState<10 | 15 | 30>(15)
   const [unansweredQuestions, setUnansweredQuestions] = useState<string[]>(supabaseConfigured ? [] : [
@@ -4850,7 +4879,7 @@ export default function App() {
     phone: "(11) 4000-1234",
     visitingRules: "Para visitar fora desse horário, fale com a equipe.",
     updatedBy: "Marta Andrade",
-    updatedAt: "12 de junho às 09:15",
+    updatedAt: `${TODAY_LABEL} às 09:15`,
   })
   const [activitiesByResident, setActivitiesByResident] = useState<Record<string, Activity[]>>(supabaseConfigured ? {} : {
     "Maria Silva": [

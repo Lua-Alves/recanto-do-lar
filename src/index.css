@@ -4288,3 +4288,85 @@ input[type="radio"] {
   font-weight: 800;
   line-height: 1;
 }
+
+/* ===== Texto grande, telas pequenas e rodapé ===== */
+/* Nada pode sair da tela quando o texto aumenta. */
+.day-strip {
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+}
+.day-strip button {
+  min-width: 0;
+  overflow: hidden;
+}
+.tab-switch button {
+  min-width: 0;
+  line-height: 1.15;
+  overflow-wrap: anywhere;
+}
+.summary-metrics div {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.resident-info small {
+  display: inline-flex;
+  flex-wrap: wrap;
+  max-width: 100%;
+}
+.nav-item {
+  min-width: 0;
+  font-size: min(var(--app-text-size, 15px), 15px);
+}
+.outline-button {
+  padding: 0 16px;
+}
+.profile-content > .outline-button {
+  width: 100%;
+}
+
+.phone--text-large .tab-switch,
+.phone--text-xlarge .tab-switch {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.phone--text-large .tab-switch--three,
+.phone--text-xlarge .tab-switch--three {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.phone--text-large .tab-switch--three button:last-child,
+.phone--text-xlarge .tab-switch--three button:last-child {
+  grid-column: span 2;
+}
+.phone--text-large .summary-metrics,
+.phone--text-xlarge .summary-metrics {
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+}
+.phone--text-large .summary-metrics--four,
+.phone--text-xlarge .summary-metrics--four {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.phone--text-large .summary-metrics div + div,
+.phone--text-xlarge .summary-metrics div + div {
+  border-left: 0;
+}
+.phone--text-large .summary-metrics--four div:nth-child(even),
+.phone--text-xlarge .summary-metrics--four div:nth-child(even) {
+  border-left: 1px solid var(--line);
+}
+.phone--text-large .summary-metrics--four div:nth-child(n + 3),
+.phone--text-xlarge .summary-metrics--four div:nth-child(n + 3) {
+  border-top: 1px solid var(--line);
+}
+
+/* No celular o app ocupa a tela toda e a página não rola (sem faixa cinza embaixo). */
+@media (max-width: 600px) {
+  html,
+  body {
+    height: 100%;
+    overflow: hidden;
+    overscroll-behavior: none;
+  }
+  .app-shell {
+    height: 100dvh;
+    min-height: 0;
+    overflow: hidden;
+  }
+}
